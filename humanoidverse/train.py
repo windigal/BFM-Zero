@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Dict, List
 from torch.utils._pytree import tree_map
 
-import exca as xk
+# import exca as xk
 import gymnasium
 import numpy as np
 import pydantic
@@ -105,10 +105,10 @@ class TrainConfig(BaseConfig):
     buffer_size: int = 5_000_000
 
     # WANDB
-    use_wandb: bool = False
-    wandb_ename: str | None = None
-    wandb_gname: str | None = None
-    wandb_pname: str | None = None
+    use_wandb: bool = True
+    wandb_ename: str | None = "windigal"
+    wandb_gname: str | None = "first-test"
+    wandb_pname: str | None = "BFM-Zero"
 
     # misc
     load_isaac_expert_data: bool = True
@@ -124,7 +124,7 @@ class TrainConfig(BaseConfig):
     tags: dict = pydantic.Field(default_factory=lambda: {})
 
     # exca
-    infra: xk.TaskInfra = xk.TaskInfra(version="1")
+    # infra: xk.TaskInfra = xk.TaskInfra(version="1")
 
     def model_post_init(self, context):
         # TODO prioritization needs tracking eval to work, but this is bit hacky to check for it
@@ -711,7 +711,7 @@ def train_bfm_zero():
         wandb_gname='bfmzero-isaac',  # run group
         wandb_pname='bfmzero-isaac',  # your wandb project name
         load_isaac_expert_data=True,
-        buffer_device='cuda',
+        buffer_device='cpu',
         disable_tqdm=True,
         evaluations=[HumanoidVerseIsaacTrackingEvaluationConfig(name='HumanoidVerseIsaacTrackingEvaluationConfig', generate_videos=False, videos_dir='videos', video_name_prefix='unknown_agent', name_in_logs='humanoidverse_tracking_eval', env=None, num_envs=1024, n_episodes_per_motion=1)],
         eval_every_steps=9600000,

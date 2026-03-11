@@ -1,0 +1,13 @@
+name: bfm-zero
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - setuptools
+  - git
+  - git-lfs
+  - pip:
+      - --extra-index-url https://pypi.nvidia.com
+      - git+https://github.com/facebookresearch/humenv.git
+      - -e .
