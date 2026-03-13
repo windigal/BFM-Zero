@@ -344,7 +344,11 @@ class FBAgent:
     
     def _sample_tracking_z(self, replay_buffer, batch_dim, traj_length):
         batch = replay_buffer["expert_slicer"].sample(batch_dim * traj_length, seq_length=traj_length)  # N*T x obs_dim
-        z = self._model.backward_map(batch["next"]["observation"])  # NT x z_dim
+        obs = tree_map(
+            lambda x: x.to(self._model.device, non_blocking=True) if isinstance(x, torch.Tensor) else x,
+            batch["next"]["observation"],
+        )
+        z = self._model.backward_map(obs)  # NT x z_dim
         z = z.view(batch_dim, traj_length, z.shape[-1])  # N x T x z_dim
         for step in range(traj_length):
             end_idx = min(step + self.cfg.model.seq_length, traj_length)

@@ -23,6 +23,7 @@ import typing as tp
 import warnings
 from pathlib import Path
 from typing import Dict, List
+from collections import OrderedDict
 from torch.utils._pytree import tree_map
 
 # import exca as xk
@@ -33,6 +34,7 @@ import torch  # better to use scoped import if we use processes
 import tyro
 import wandb
 from packaging.version import Version
+from torch.utils.tensorboard import SummaryWriter
 from torch.utils._pytree import tree_map
 from tqdm import tqdm
 
@@ -51,6 +53,119 @@ REWARD_EVAL_LOG_FILENAME = "reward_eval_log.csv"
 TRACKING_EVAL_LOG_FILENAME = "tracking_eval_log.csv"
 
 CHECKPOINT_DIR_NAME = "checkpoint"
+
+TRAIN_METRIC_GROUPS = OrderedDict(
+    [
+        ("FB", ["B", "B_norm", "z_norm", "F1", "M1", "target_M", "fb_diag", "fb_offdiag", "orth_loss_diag", "orth_loss_offdiag", "orth_loss", "q_loss", "fb_loss"]),
+        ("Discriminator", ["disc_expert_loss", "disc_train_loss", "disc_wgan_gp_loss", "disc_loss", "mean_disc_reward"]),
+        ("Critic", ["target_Q", "Q1", "mean_next_Q", "unc_Q", "critic_loss"]),
+        ("Aux Critic", ["target_auxQ", "auxQ1", "mean_next_auxQ", "unc_auxQ", "aux_critic_loss", "mean_aux_reward"]),
+        ("Actor", ["Q_discriminator", "Q_aux", "Q_fb", "actor_loss"]),
+        (
+            "Aux Rewards",
+            [
+                "aux_rew/penalty_torques",
+                "aux_rew/penalty_action_rate",
+                "aux_rew/limits_dof_pos",
+                "aux_rew/limits_torque",
+                "aux_rew/penalty_undesired_contact",
+                "aux_rew/penalty_feet_ori",
+                "aux_rew/penalty_ankle_roll",
+                "aux_rew/penalty_slippage",
+            ],
+        ),
+        ("Runtime", ["FPS", "duration [minutes]"]),
+    ]
+)
+
+
+def _format_metric_value(value: float) -> str:
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if abs(value) >= 1000 or (0 < abs(value) < 1e-3):
+        return f"{value:.4e}"
+    return f"{value:.6f}".rstrip("0").rstrip(".")
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(int(seconds), 0)
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _build_grouped_metrics(metrics: dict[str, float]) -> OrderedDict[str, list[tuple[str, float]]]:
+    grouped = OrderedDict()
+    used = set()
+    for group_name, keys in TRAIN_METRIC_GROUPS.items():
+        items = [(key, metrics[key]) for key in keys if key in metrics]
+        if items:
+            grouped[group_name] = items
+            used.update(key for key, _ in items)
+    leftover = [(key, metrics[key]) for key in sorted(metrics.keys()) if key not in used]
+    if leftover:
+        grouped["Other"] = leftover
+    return grouped
+
+
+def _print_grouped_train_log(
+    *,
+    grouped_metrics: OrderedDict[str, list[tuple[str, float]]],
+    timestep: int,
+    max_timesteps: int,
+    iteration: int,
+    max_iterations: int,
+    collection_time: float,
+    learning_time: float,
+    elapsed_time: float,
+    eta_seconds: float,
+) -> None:
+    width = 88
+    print("#" * width)
+    print(f"{'Learning iteration ' + str(iteration) + '/' + str(max_iterations):^{width}}")
+    print()
+    print(
+        f"{'Computation:':>28} "
+        f"{_format_metric_value(grouped_metrics.get('Runtime', [])[0][1] if grouped_metrics.get('Runtime') else 0.0)} steps/s "
+        f"(collection: {collection_time:.3f}s, learning: {learning_time:.3f}s)"
+    )
+    for group_name, items in grouped_metrics.items():
+        print(f"{group_name}:")
+        for key, value in items:
+            print(f"{key:>28}: {_format_metric_value(value)}")
+    print("-" * width)
+    print(f"{'Total timesteps:':>28} {timestep}")
+    print(f"{'Iteration time:':>28} {(collection_time + learning_time):.2f}s")
+    print(f"{'Time elapsed:':>28} {_format_duration(elapsed_time)}")
+    print(f"{'ETA:':>28} {_format_duration(eta_seconds)}")
+
+
+def _log_grouped_tensorboard(
+    writer: SummaryWriter | None,
+    grouped_metrics: OrderedDict[str, list[tuple[str, float]]],
+    timestep: int,
+    *,
+    collection_time: float,
+    learning_time: float,
+    elapsed_time: float,
+    eta_seconds: float,
+    iteration: int,
+) -> None:
+    if writer is None:
+        return
+    for group_name, items in grouped_metrics.items():
+        group_slug = group_name.lower().replace(" ", "_")
+        for key, value in items:
+            tag_key = key.replace("aux_rew/", "")
+            writer.add_scalar(f"train/{group_slug}/{tag_key}", value, timestep)
+    writer.add_scalar("train/summary/timestep", timestep, timestep)
+    writer.add_scalar("train/summary/iteration", iteration, timestep)
+    writer.add_scalar("train/summary/collection_time", collection_time, timestep)
+    writer.add_scalar("train/summary/learning_time", learning_time, timestep)
+    writer.add_scalar("train/summary/iteration_time", collection_time + learning_time, timestep)
+    writer.add_scalar("train/summary/elapsed_time", elapsed_time, timestep)
+    writer.add_scalar("train/summary/eta_seconds", eta_seconds, timestep)
+    writer.flush()
 
 _ENC_CONFIG_TO_EXPERT_DATA_OBS_MAPPER = {
     HumanoidVerseIsaacConfig: None,
@@ -219,6 +334,7 @@ class Workspace:
                 OmegaConf.save(self.train_env_info["unresolved_conf"], file)
 
         self.train_logger = CSVLogger(filename=self.work_dir / TRAIN_LOG_FILENAME)
+        self.tb_writer = SummaryWriter(log_dir=str(self.work_dir / "tensorboard"))
 
         set_seed_everywhere(self.cfg.seed)
 
@@ -256,7 +372,10 @@ class Workspace:
 
     def train(self):
         self.start_time = time.time()
-        self.train_online()
+        try:
+            self.train_online()
+        finally:
+            self.tb_writer.close()
 
     def train_online(self) -> None:
         if self.training_with_expert_data:
@@ -321,6 +440,8 @@ class Workspace:
         total_metrics, context = None, None
         start_time = time.time()
         fps_start_time = time.time()
+        collection_time_acc = 0.0
+        learning_time_acc = 0.0
         checkpoint_time_checker = EveryNStepsChecker(self._checkpoint_time, self.cfg.checkpoint_every_steps)
         eval_time_checker = EveryNStepsChecker(self._checkpoint_time, self.cfg.eval_every_steps)
         update_agent_time_checker = EveryNStepsChecker(self._checkpoint_time, self.cfg.update_agent_every)
@@ -393,6 +514,7 @@ class Workspace:
                         priorities=priorities.to(self.cfg.buffer_device), idxs=torch.tensor(np.array(idxs), device=self.cfg.buffer_device)
                     )
 
+            rollout_start = time.time()
             with torch.no_grad():
                 obs = tree_map(lambda x: torch.tensor(x, dtype=dtype_numpytotorch_lower_precision(x.dtype), device=self.agent.device), td)
                 # TODO consistency with obs_space: remove time assigned by TimeAwareObservationWrapper
@@ -421,6 +543,7 @@ class Workspace:
                     if not isinstance(self.cfg.env, HumanoidVerseIsaacConfig):
                         action = action.cpu().detach().numpy()
             new_td, new_reward, new_terminated, new_truncated, new_info = train_env.step(action)
+            collection_time_acc += time.time() - rollout_start
 
             # we check if at the next iteration we will evaluate
             next_t = t + self.cfg.online_parallel_envs
@@ -494,6 +617,7 @@ class Workspace:
 
             if len(replay_buffer["train"]) > 0 and t > self.cfg.num_seed_steps and update_agent_time_checker.check(t):
                 update_agent_time_checker.update_last_step(t)
+                learning_start = time.time()
                 for _ in range(self.cfg.num_agent_updates):
                     metrics = self.agent.update(replay_buffer, t)
                     if total_metrics is None:
@@ -502,6 +626,7 @@ class Workspace:
                     else:
                         num_metrics_updates += 1
                         total_metrics = {k: total_metrics[k] + metrics[k].float() for k in metrics.keys()}
+                learning_time_acc += time.time() - learning_start
 
             if log_time_checker.check(t) and total_metrics is not None:
                 log_time_checker.update_last_step(t)
@@ -516,9 +641,37 @@ class Workspace:
                         {f"train/{k}": v for k, v in m_dict.items()},
                         step=t,
                     )
-                print(m_dict)
+                grouped_metrics = _build_grouped_metrics(m_dict)
+                current_iteration = t // self.cfg.online_parallel_envs
+                max_iterations = self.cfg.num_env_steps // self.cfg.online_parallel_envs
+                elapsed_time = time.time() - start_time
+                progress_ratio = max(t / max(self.cfg.num_env_steps, 1), 1e-9)
+                eta_seconds = (elapsed_time / progress_ratio) - elapsed_time
+                _print_grouped_train_log(
+                    grouped_metrics=grouped_metrics,
+                    timestep=t,
+                    max_timesteps=self.cfg.num_env_steps,
+                    iteration=current_iteration,
+                    max_iterations=max_iterations,
+                    collection_time=collection_time_acc,
+                    learning_time=learning_time_acc,
+                    elapsed_time=elapsed_time,
+                    eta_seconds=eta_seconds,
+                )
+                _log_grouped_tensorboard(
+                    self.tb_writer,
+                    grouped_metrics,
+                    t,
+                    collection_time=collection_time_acc,
+                    learning_time=learning_time_acc,
+                    elapsed_time=elapsed_time,
+                    eta_seconds=eta_seconds,
+                    iteration=current_iteration,
+                )
                 total_metrics = None
                 fps_start_time = time.time()
+                collection_time_acc = 0.0
+                learning_time_acc = 0.0
                 m_dict["timestep"] = t
                 self.train_logger.log(m_dict)
 
@@ -563,6 +716,9 @@ class Workspace:
                     {f"eval/{evaluation_name}/{k}": v for k, v in wandb_dict.items()},
                     step=t,
                 )
+            if wandb_dict is not None:
+                for k, v in wandb_dict.items():
+                    self.tb_writer.add_scalar(f"eval/{evaluation_name}/{k}", v, t)
 
             evaluation_results[evaluation_name] = evaluation_metrics
 
@@ -664,7 +820,7 @@ def train_bfm_zero():
             aux_rewards=['penalty_torques', 'penalty_action_rate', 'limits_dof_pos', 'limits_torque', 'penalty_undesired_contact', 'penalty_feet_ori', 'penalty_ankle_roll', 'penalty_slippage'],
             aux_rewards_scaling={'penalty_action_rate': -0.1, 'penalty_feet_ori': -0.4, 'penalty_ankle_roll': -4.0, 'limits_dof_pos': -10.0, 'penalty_slippage': -2.0, 'penalty_undesired_contact': -1.0, 'penalty_torques': 0.0, 'limits_torque': 0.0},
             cudagraphs=False,
-            compile=True
+            compile=False
         ),
         motions='',
         motions_root='',

@@ -10,4 +10,5 @@ dependencies:
   - pip:
       - --extra-index-url https://pypi.nvidia.com
       - git+https://github.com/facebookresearch/humenv.git
+      - tensorboard>=2.18.0
       - -e .
