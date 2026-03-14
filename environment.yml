@@ -2,13 +2,16 @@ name: bfm-zero
 channels:
   - conda-forge
 dependencies:
-  - python=3.10
+  - python=3.11
   - pip
-  - setuptools
+  - setuptools<82
   - git
   - git-lfs
   - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu128
       - --extra-index-url https://pypi.nvidia.com
+      - torch==2.7.0
+      - torchvision==0.22.0
       - git+https://github.com/facebookresearch/humenv.git
       - tensorboard>=2.18.0
       - -e .

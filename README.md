@@ -33,9 +33,26 @@ Humanoidverse training for BFM-Zero with Isaac Sim or MuJoCo.
 
 ## Requirements
 
-- Python 3.10
+- Python 3.11
 - CUDA-capable GPU
 - Isaac Sim (Linux) or MuJoCo for simulation
+
+Current Isaac stack in this repo:
+
+- Isaac Sim `5.1.0`
+- Isaac Lab `2.3.0`
+- PyTorch `2.7.0` with CUDA `12.8`
+
+For RTX 50-series GPUs, use a fresh Python 3.11 environment and follow the Isaac Sim 5.1 driver requirements.
+
+If environment creation fails while building `flatdict==4.0.1` with `ModuleNotFoundError: pkg_resources`, pin `setuptools<82` and disable pip build isolation for the initial install:
+
+```bash
+export PIP_NO_BUILD_ISOLATION=1
+conda env create -f environment.yml
+```
+
+This is needed because `pkg_resources` was removed from newer `setuptools`, while the `flatdict` version pulled by Isaac Lab 2.3 still expects it during wheel build.
 
 ## Installation
 

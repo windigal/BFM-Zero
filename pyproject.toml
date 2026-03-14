@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools<82"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,7 @@ name = "motivo-isaac"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = "==3.10.*"
+requires-python = "==3.11.*"
 dependencies = [
     "easydict>=1.13",
     "exca>=0.2.5",
@@ -15,8 +15,8 @@ dependencies = [
     "huggingface-hub>=0.30.2",
     "humenv",
     "hydra-core>=1.2.0",
-    "isaaclab[all,isaacsim]==2.0.2; sys_platform == 'linux'",
-    "isaacsim[all,extscache]==4.5.0; sys_platform == 'linux'",
+    "isaaclab[all,isaacsim]==2.3.0; sys_platform == 'linux'",
+    "isaacsim[all,extscache]==5.1.0; sys_platform == 'linux'",
     "joblib>=1.4.2",
     "loguru>=0.7.3",
     "lxml>=5.3.2",
@@ -35,13 +35,17 @@ dependencies = [
     "tensordict>=0.8.3",
     "tensorboard>=2.18.0",
     "termcolor>=3.0.1",
-    "torch>=2.5.0",
+    "torch==2.7.0",
+    "torchvision==0.22.0",
     "tyro>=0.9.18",
     "xxhash>=3.5.0",
 ]
 
 [[tool.uv.index]]
 url = "https://pypi.nvidia.com/"
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu128"
 
 # [project.optional-dependencies]
 # sim2real = [

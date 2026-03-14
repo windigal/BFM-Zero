@@ -24,4 +24,4 @@ build/
 wandb/
 results/
 
-/humanoidverse/data/*.pkl
+*.pdf

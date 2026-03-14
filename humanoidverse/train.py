@@ -21,6 +21,7 @@ import json
 import time
 import typing as tp
 import warnings
+from decimal import Decimal
 from pathlib import Path
 from typing import Dict, List
 from collections import OrderedDict
@@ -74,7 +75,6 @@ TRAIN_METRIC_GROUPS = OrderedDict(
                 "aux_rew/penalty_slippage",
             ],
         ),
-        ("Runtime", ["FPS", "duration [minutes]"]),
     ]
 )
 
@@ -82,9 +82,12 @@ TRAIN_METRIC_GROUPS = OrderedDict(
 def _format_metric_value(value: float) -> str:
     if isinstance(value, (int, np.integer)):
         return str(int(value))
-    if abs(value) >= 1000 or (0 < abs(value) < 1e-3):
-        return f"{value:.4e}"
-    return f"{value:.6f}".rstrip("0").rstrip(".")
+    text = format(Decimal(str(float(value))), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    if text in {"", "-0"}:
+        return "0"
+    return text
 
 
 def _format_duration(seconds: float) -> str:
@@ -92,6 +95,11 @@ def _format_duration(seconds: float) -> str:
     hours, rem = divmod(seconds, 3600)
     minutes, secs = divmod(rem, 60)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _make_timestamped_result_dir(base_dir: str) -> str:
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    return str(Path(base_dir) / timestamp)
 
 
 def _build_grouped_metrics(metrics: dict[str, float]) -> OrderedDict[str, list[tuple[str, float]]]:
@@ -108,6 +116,56 @@ def _build_grouped_metrics(metrics: dict[str, float]) -> OrderedDict[str, list[t
     return grouped
 
 
+def _render_grouped_train_log(
+    *,
+    grouped_metrics: OrderedDict[str, list[tuple[str, float]]],
+    timestep: int,
+    max_timesteps: int,
+    iteration: int,
+    max_iterations: int,
+    steps_per_second: float,
+    collection_time: float,
+    learning_time: float,
+    elapsed_time: float,
+    eta_seconds: float,
+) -> str:
+    width = 88
+    summary_labels = ["Computation", "Total timesteps", "Iteration time", "Time elapsed", "ETA"]
+    metric_labels = [
+        key if "/" in key else f"{group_name}/{key}"
+        for group_name, items in grouped_metrics.items()
+        for key, _ in items
+    ]
+    label_width = max([len(label) for label in metric_labels + summary_labels], default=0)
+
+    lines = [
+        "#" * width,
+        f"{'Learning iteration ' + str(iteration) + '/' + str(max_iterations):^{width}}",
+        "",
+        (
+            f"{'Computation':>{label_width}}: "
+            f"{_format_metric_value(steps_per_second)} steps/s "
+            f"(collection: {collection_time:.3f}s, learning: {learning_time:.3f}s)"
+        ),
+    ]
+
+    for group_name, items in grouped_metrics.items():
+        for key, value in items:
+            metric_label = key if "/" in key else f"{group_name}/{key}"
+            lines.append(f"{metric_label:>{label_width}}: {_format_metric_value(value)}")
+
+    lines.extend(
+        [
+            "-" * width,
+            f"{'Total timesteps':>{label_width}}: {timestep}",
+            f"{'Iteration time':>{label_width}}: {collection_time + learning_time:.2f}s",
+            f"{'Time elapsed':>{label_width}}: {_format_duration(elapsed_time)}",
+            f"{'ETA':>{label_width}}: {_format_duration(eta_seconds)}",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _print_grouped_train_log(
     *,
     grouped_metrics: OrderedDict[str, list[tuple[str, float]]],
@@ -115,29 +173,26 @@ def _print_grouped_train_log(
     max_timesteps: int,
     iteration: int,
     max_iterations: int,
+    steps_per_second: float,
     collection_time: float,
     learning_time: float,
     elapsed_time: float,
     eta_seconds: float,
-) -> None:
-    width = 88
-    print("#" * width)
-    print(f"{'Learning iteration ' + str(iteration) + '/' + str(max_iterations):^{width}}")
-    print()
-    print(
-        f"{'Computation:':>28} "
-        f"{_format_metric_value(grouped_metrics.get('Runtime', [])[0][1] if grouped_metrics.get('Runtime') else 0.0)} steps/s "
-        f"(collection: {collection_time:.3f}s, learning: {learning_time:.3f}s)"
+) -> str:
+    log_text = _render_grouped_train_log(
+        grouped_metrics=grouped_metrics,
+        timestep=timestep,
+        max_timesteps=max_timesteps,
+        iteration=iteration,
+        max_iterations=max_iterations,
+        steps_per_second=steps_per_second,
+        collection_time=collection_time,
+        learning_time=learning_time,
+        elapsed_time=elapsed_time,
+        eta_seconds=eta_seconds,
     )
-    for group_name, items in grouped_metrics.items():
-        print(f"{group_name}:")
-        for key, value in items:
-            print(f"{key:>28}: {_format_metric_value(value)}")
-    print("-" * width)
-    print(f"{'Total timesteps:':>28} {timestep}")
-    print(f"{'Iteration time:':>28} {(collection_time + learning_time):.2f}s")
-    print(f"{'Time elapsed:':>28} {_format_duration(elapsed_time)}")
-    print(f"{'ETA:':>28} {_format_duration(eta_seconds)}")
+    print(log_text, flush=True)
+    return log_text
 
 
 def _log_grouped_tensorboard(
@@ -150,6 +205,8 @@ def _log_grouped_tensorboard(
     elapsed_time: float,
     eta_seconds: float,
     iteration: int,
+    formatted_log: str | None = None,
+    text_log_every_iterations: int = 100,
 ) -> None:
     if writer is None:
         return
@@ -165,6 +222,12 @@ def _log_grouped_tensorboard(
     writer.add_scalar("train/summary/iteration_time", collection_time + learning_time, timestep)
     writer.add_scalar("train/summary/elapsed_time", elapsed_time, timestep)
     writer.add_scalar("train/summary/eta_seconds", eta_seconds, timestep)
+    if (
+        formatted_log is not None
+        and text_log_every_iterations > 0
+        and (iteration == 1 or iteration % text_log_every_iterations == 0)
+    ):
+        writer.add_text("train/summary/console", f"```text\n{formatted_log}\n```", timestep)
     writer.flush()
 
 _ENC_CONFIG_TO_EXPERT_DATA_OBS_MAPPER = {
@@ -230,6 +293,7 @@ class TrainConfig(BaseConfig):
     buffer_device: str = "cpu"
     # Default to True; otherwise you will spam the console with tqdm
     disable_tqdm: bool = True
+    tensorboard_text_every_iterations: int = 100
 
     # If you want to add more available evaluations, Update "Evaluations" type above
     evaluations: Dict[str, Evaluation] | List[Evaluation] = pydantic.Field(default_factory=lambda: [])
@@ -439,9 +503,10 @@ class Workspace:
         done = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
         total_metrics, context = None, None
         start_time = time.time()
-        fps_start_time = time.time()
         collection_time_acc = 0.0
         learning_time_acc = 0.0
+        steps_since_last_log = 0
+        train_time_total = 0.0
         checkpoint_time_checker = EveryNStepsChecker(self._checkpoint_time, self.cfg.checkpoint_every_steps)
         eval_time_checker = EveryNStepsChecker(self._checkpoint_time, self.cfg.eval_every_steps)
         update_agent_time_checker = EveryNStepsChecker(self._checkpoint_time, self.cfg.update_agent_every)
@@ -544,6 +609,7 @@ class Workspace:
                         action = action.cpu().detach().numpy()
             new_td, new_reward, new_terminated, new_truncated, new_info = train_env.step(action)
             collection_time_acc += time.time() - rollout_start
+            steps_since_last_log += self.cfg.online_parallel_envs
 
             # we check if at the next iteration we will evaluate
             next_t = t + self.cfg.online_parallel_envs
@@ -630,29 +696,34 @@ class Workspace:
 
             if log_time_checker.check(t) and total_metrics is not None:
                 log_time_checker.update_last_step(t)
+                current_timestep = min(t + self.cfg.online_parallel_envs, self.cfg.num_env_steps)
                 m_dict = {}
                 for k in sorted(list(total_metrics.keys())):
                     tmp = total_metrics[k] / num_metrics_updates
                     m_dict[k] = np.round(tmp.mean().item(), 6)
-                m_dict["duration [minutes]"] = (time.time() - start_time) / 60
-                m_dict["FPS"] = (1 if t == 0 else self.cfg.log_every_updates) / (time.time() - fps_start_time)
+                interval_train_time = collection_time_acc + learning_time_acc
+                train_time_total += interval_train_time
+                interval_fps = steps_since_last_log / max(interval_train_time, 1e-9)
+                total_train_steps = max(current_timestep - self._checkpoint_time, 0)
+                avg_train_fps = total_train_steps / max(train_time_total, 1e-9) if total_train_steps > 0 else interval_fps
                 if self.cfg.use_wandb:
                     wandb.log(
                         {f"train/{k}": v for k, v in m_dict.items()},
-                        step=t,
+                        step=current_timestep,
                     )
                 grouped_metrics = _build_grouped_metrics(m_dict)
-                current_iteration = t // self.cfg.online_parallel_envs
+                current_iteration = current_timestep // self.cfg.online_parallel_envs
                 max_iterations = self.cfg.num_env_steps // self.cfg.online_parallel_envs
                 elapsed_time = time.time() - start_time
-                progress_ratio = max(t / max(self.cfg.num_env_steps, 1), 1e-9)
-                eta_seconds = (elapsed_time / progress_ratio) - elapsed_time
-                _print_grouped_train_log(
+                remaining_steps = max(self.cfg.num_env_steps - current_timestep, 0)
+                eta_seconds = remaining_steps / max(avg_train_fps, 1e-9) if remaining_steps > 0 else 0.0
+                log_text = _print_grouped_train_log(
                     grouped_metrics=grouped_metrics,
-                    timestep=t,
+                    timestep=current_timestep,
                     max_timesteps=self.cfg.num_env_steps,
                     iteration=current_iteration,
                     max_iterations=max_iterations,
+                    steps_per_second=interval_fps,
                     collection_time=collection_time_acc,
                     learning_time=learning_time_acc,
                     elapsed_time=elapsed_time,
@@ -661,18 +732,21 @@ class Workspace:
                 _log_grouped_tensorboard(
                     self.tb_writer,
                     grouped_metrics,
-                    t,
+                    current_timestep,
                     collection_time=collection_time_acc,
                     learning_time=learning_time_acc,
                     elapsed_time=elapsed_time,
                     eta_seconds=eta_seconds,
                     iteration=current_iteration,
+                    formatted_log=log_text,
+                    text_log_every_iterations=self.cfg.tensorboard_text_every_iterations,
                 )
                 total_metrics = None
-                fps_start_time = time.time()
                 collection_time_acc = 0.0
                 learning_time_acc = 0.0
-                m_dict["timestep"] = t
+                steps_since_last_log = 0
+                m_dict["timestep"] = current_timestep
+                m_dict["iteration"] = current_iteration
                 self.train_logger.log(m_dict)
 
             progb.update(self.cfg.online_parallel_envs)
@@ -758,12 +832,12 @@ def train_bfm_zero():
                     name='FBcprAuxModelArchiConfig',
                     z_dim=256,
                     norm_z=True,
-                    f=ForwardArchiConfig(name='ForwardArchi', hidden_dim=2048, model='residual', hidden_layers=6, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
+                    f=ForwardArchiConfig(name='ForwardArchi', hidden_dim=1024, model='residual', hidden_layers=4, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
                     b=BackwardArchiConfig(name='BackwardArchi', hidden_dim=256, hidden_layers=1, norm=True, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
-                    actor=ActorArchiConfig(name='actor', model='residual', hidden_dim=2048, hidden_layers=6, embedding_layers=2, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'last_action', 'history_actor'])),
-                    critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=2048, model='residual', hidden_layers=6, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
-                    discriminator=DiscriminatorArchiConfig(name='DiscriminatorArchi', hidden_dim=1024, hidden_layers=3, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
-                    aux_critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=2048, model='residual', hidden_layers=6, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor']))
+                    actor=ActorArchiConfig(name='actor', model='residual', hidden_dim=1024, hidden_layers=4, embedding_layers=2, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'last_action', 'history_actor'])),
+                    critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=1024, model='residual', hidden_layers=4, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
+                    discriminator=DiscriminatorArchiConfig(name='DiscriminatorArchi', hidden_dim=512, hidden_layers=3, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
+                    aux_critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=1024, model='residual', hidden_layers=4, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor']))
                 ),
                 obs_normalizer=ObsNormalizerConfig(
                     name='ObsNormalizerConfig',
@@ -778,7 +852,7 @@ def train_bfm_zero():
                 inference_batch_size=500000,
                 seq_length=8,
                 actor_std=0.05,
-                amp=False,
+                amp=True,
                 norm_aux_reward=RewardNormalizerConfig(name='RewardNormalizer', translate=False, scale=True)
             ),
             train=FBcprAuxAgentTrainConfig(
@@ -820,7 +894,7 @@ def train_bfm_zero():
             aux_rewards=['penalty_torques', 'penalty_action_rate', 'limits_dof_pos', 'limits_torque', 'penalty_undesired_contact', 'penalty_feet_ori', 'penalty_ankle_roll', 'penalty_slippage'],
             aux_rewards_scaling={'penalty_action_rate': -0.1, 'penalty_feet_ori': -0.4, 'penalty_ankle_roll': -4.0, 'limits_dof_pos': -10.0, 'penalty_slippage': -2.0, 'penalty_undesired_contact': -1.0, 'penalty_torques': 0.0, 'limits_torque': 0.0},
             cudagraphs=False,
-            compile=False
+            compile=True
         ),
         motions='',
         motions_root='',
@@ -845,11 +919,11 @@ def train_bfm_zero():
             make_config_g1env_compatible=False,
             root_height_obs=True
         ),
-        work_dir='results/bfmzero-isaac',
-        seed=4728,
+        work_dir=_make_timestamped_result_dir('results/bfmzero-isaac'),
+        seed=42,
         online_parallel_envs=1024,
-        log_every_updates=384000,
-        num_env_steps=384000000,
+        log_every_updates=1024,
+        num_env_steps=102400000,
         update_agent_every=1024,
         num_seed_steps=10240,
         num_agent_updates=16,
@@ -862,10 +936,10 @@ def train_bfm_zero():
         prioritization_mode='exp',
         use_trajectory_buffer=True,
         buffer_size=5120000,
-        use_wandb=False,
-        wandb_ename='yitangl',  # your wandb entity (username/team), empty = default from wandb login
-        wandb_gname='bfmzero-isaac',  # run group
-        wandb_pname='bfmzero-isaac',  # your wandb project name
+        use_wandb=True,
+        wandb_ename='windigal',  # your wandb entity (username/team), empty = default from wandb login
+        wandb_gname='first-test',  # run group
+        wandb_pname='BFM-Zero',  # your wandb project name
         load_isaac_expert_data=True,
         buffer_device='cpu',
         disable_tqdm=True,
