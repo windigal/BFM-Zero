@@ -116,6 +116,14 @@ def _build_grouped_metrics(metrics: dict[str, float]) -> OrderedDict[str, list[t
     return grouped
 
 
+def _iter_tracked_group_metrics(
+    grouped_metrics: OrderedDict[str, list[tuple[str, float]]],
+) -> tp.Iterator[tuple[str, str, float]]:
+    for group_name in TRAIN_METRIC_GROUPS.keys():
+        for key, value in grouped_metrics.get(group_name, []):
+            yield group_name, key, value
+
+
 def _render_grouped_train_log(
     *,
     grouped_metrics: OrderedDict[str, list[tuple[str, float]]],
@@ -210,24 +218,10 @@ def _log_grouped_tensorboard(
 ) -> None:
     if writer is None:
         return
-    for group_name, items in grouped_metrics.items():
+    for group_name, key, value in _iter_tracked_group_metrics(grouped_metrics):
         group_slug = group_name.lower().replace(" ", "_")
-        for key, value in items:
-            tag_key = key.replace("aux_rew/", "")
-            writer.add_scalar(f"train/{group_slug}/{tag_key}", value, timestep)
-    writer.add_scalar("train/summary/timestep", timestep, timestep)
-    writer.add_scalar("train/summary/iteration", iteration, timestep)
-    writer.add_scalar("train/summary/collection_time", collection_time, timestep)
-    writer.add_scalar("train/summary/learning_time", learning_time, timestep)
-    writer.add_scalar("train/summary/iteration_time", collection_time + learning_time, timestep)
-    writer.add_scalar("train/summary/elapsed_time", elapsed_time, timestep)
-    writer.add_scalar("train/summary/eta_seconds", eta_seconds, timestep)
-    if (
-        formatted_log is not None
-        and text_log_every_iterations > 0
-        and (iteration == 1 or iteration % text_log_every_iterations == 0)
-    ):
-        writer.add_text("train/summary/console", f"```text\n{formatted_log}\n```", timestep)
+        tag_key = key.replace("aux_rew/", "")
+        writer.add_scalar(f"train/{group_slug}/{tag_key}", value, timestep)
     writer.flush()
 
 _ENC_CONFIG_TO_EXPERT_DATA_OBS_MAPPER = {
@@ -293,7 +287,7 @@ class TrainConfig(BaseConfig):
     buffer_device: str = "cpu"
     # Default to True; otherwise you will spam the console with tqdm
     disable_tqdm: bool = True
-    tensorboard_text_every_iterations: int = 100
+    tensorboard_text_every_iterations: int = 256
 
     # If you want to add more available evaluations, Update "Evaluations" type above
     evaluations: Dict[str, Evaluation] | List[Evaluation] = pydantic.Field(default_factory=lambda: [])
@@ -706,12 +700,12 @@ class Workspace:
                 interval_fps = steps_since_last_log / max(interval_train_time, 1e-9)
                 total_train_steps = max(current_timestep - self._checkpoint_time, 0)
                 avg_train_fps = total_train_steps / max(train_time_total, 1e-9) if total_train_steps > 0 else interval_fps
+                grouped_metrics = _build_grouped_metrics(m_dict)
                 if self.cfg.use_wandb:
                     wandb.log(
-                        {f"train/{k}": v for k, v in m_dict.items()},
+                        {f"train/{key}": value for _, key, value in _iter_tracked_group_metrics(grouped_metrics)},
                         step=current_timestep,
                     )
-                grouped_metrics = _build_grouped_metrics(m_dict)
                 current_iteration = current_timestep // self.cfg.online_parallel_envs
                 max_iterations = self.cfg.num_env_steps // self.cfg.online_parallel_envs
                 elapsed_time = time.time() - start_time
@@ -828,16 +822,27 @@ def train_bfm_zero():
             model=FBcprAuxModelConfig(
                 name='FBcprAuxModel',
                 device='cuda',
+                # archi=FBcprAuxModelArchiConfig(
+                #     name='FBcprAuxModelArchiConfig',
+                #     z_dim=256,
+                #     norm_z=True,
+                #     f=ForwardArchiConfig(name='ForwardArchi', hidden_dim=1024, model='residual', hidden_layers=4, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
+                #     b=BackwardArchiConfig(name='BackwardArchi', hidden_dim=256, hidden_layers=1, norm=True, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
+                #     actor=ActorArchiConfig(name='actor', model='residual', hidden_dim=1024, hidden_layers=4, embedding_layers=2, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'last_action', 'history_actor'])),
+                #     critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=1024, model='residual', hidden_layers=4, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
+                #     discriminator=DiscriminatorArchiConfig(name='DiscriminatorArchi', hidden_dim=512, hidden_layers=3, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
+                #     aux_critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=1024, model='residual', hidden_layers=4, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor']))
+                # ),
                 archi=FBcprAuxModelArchiConfig(
                     name='FBcprAuxModelArchiConfig',
                     z_dim=256,
                     norm_z=True,
-                    f=ForwardArchiConfig(name='ForwardArchi', hidden_dim=1024, model='residual', hidden_layers=4, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
+                    f=ForwardArchiConfig(name='ForwardArchi', hidden_dim=2048, model='residual', hidden_layers=6, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
                     b=BackwardArchiConfig(name='BackwardArchi', hidden_dim=256, hidden_layers=1, norm=True, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
-                    actor=ActorArchiConfig(name='actor', model='residual', hidden_dim=1024, hidden_layers=4, embedding_layers=2, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'last_action', 'history_actor'])),
-                    critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=1024, model='residual', hidden_layers=4, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
-                    discriminator=DiscriminatorArchiConfig(name='DiscriminatorArchi', hidden_dim=512, hidden_layers=3, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
-                    aux_critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=1024, model='residual', hidden_layers=4, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor']))
+                    actor=ActorArchiConfig(name='actor', model='residual', hidden_dim=2048, hidden_layers=6, embedding_layers=2, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'last_action', 'history_actor'])),
+                    critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=2048, model='residual', hidden_layers=6, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
+                    discriminator=DiscriminatorArchiConfig(name='DiscriminatorArchi', hidden_dim=1024, hidden_layers=3, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
+                    aux_critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=2048, model='residual', hidden_layers=6, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor']))
                 ),
                 obs_normalizer=ObsNormalizerConfig(
                     name='ObsNormalizerConfig',
@@ -923,7 +928,7 @@ def train_bfm_zero():
         seed=42,
         online_parallel_envs=1024,
         log_every_updates=1024,
-        num_env_steps=102400000,
+        num_env_steps=384000000,
         update_agent_every=1024,
         num_seed_steps=10240,
         num_agent_updates=16,

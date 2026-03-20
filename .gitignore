@@ -24,4 +24,9 @@ build/
 wandb/
 results/
 
+# else
+*.pkl
 *.pdf
+*.csv
+*.md
+!README.md
