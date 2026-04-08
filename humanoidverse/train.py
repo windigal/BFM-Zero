@@ -102,6 +102,34 @@ def _make_timestamped_result_dir(base_dir: str) -> str:
     return str(Path(base_dir) / timestamp)
 
 
+def _read_checkpoint_time(run_dir: Path) -> int | None:
+    status_path = run_dir / CHECKPOINT_DIR_NAME / "train_status.json"
+    if not status_path.exists():
+        return None
+    try:
+        with status_path.open("r") as f:
+            train_status = json.load(f)
+        return int(train_status["time"])
+    except Exception:
+        return None
+
+
+def _find_latest_resumable_run(base_dir: Path, *, max_time: int | None = None) -> Path | None:
+    if not base_dir.exists():
+        return None
+    candidates: list[Path] = []
+    for run_dir in sorted(base_dir.iterdir(), reverse=True):
+        if not run_dir.is_dir():
+            continue
+        checkpoint_time = _read_checkpoint_time(run_dir)
+        if checkpoint_time is None:
+            continue
+        if max_time is not None and checkpoint_time >= max_time:
+            continue
+        candidates.append(run_dir)
+    return candidates[0] if candidates else None
+
+
 def _build_grouped_metrics(metrics: dict[str, float]) -> OrderedDict[str, list[tuple[str, float]]]:
     grouped = OrderedDict()
     used = set()
@@ -263,7 +291,11 @@ class TrainConfig(BaseConfig):
     num_agent_updates: int = 50
     # Note: this is in env steps (multiples of online_parallel_envs)
     checkpoint_every_steps: int = 5_000_000
+    checkpoint_every_iterations: int | None = None
     checkpoint_buffer: bool = True
+    checkpoint_buffer_every_steps: int = 100_000
+    checkpoint_buffer_every_iterations: int | None = None
+    resume_latest_run: bool = False
     prioritization: bool = False
     prioritization_min_val: float = 0.5
     prioritization_max_val: float = 5
@@ -300,6 +332,18 @@ class TrainConfig(BaseConfig):
     # infra: xk.TaskInfra = xk.TaskInfra(version="1")
 
     def model_post_init(self, context):
+        if self.checkpoint_every_iterations is not None:
+            object.__setattr__(
+                self,
+                "checkpoint_every_steps",
+                int(self.checkpoint_every_iterations * self.online_parallel_envs),
+            )
+        if self.checkpoint_buffer_every_iterations is not None:
+            object.__setattr__(
+                self,
+                "checkpoint_buffer_every_steps",
+                int(self.checkpoint_buffer_every_iterations * self.online_parallel_envs),
+            )
         # TODO prioritization needs tracking eval to work, but this is bit hacky to check for it
         if self.load_isaac_expert_data and not isinstance(self.env, HumanoidVerseIsaacConfig):
             raise ValueError("Loading expert isaac data is only supported for HumanoidVerseIsaacConfig")
@@ -339,16 +383,17 @@ class TrainConfig(BaseConfig):
 def create_agent_or_load_checkpoint(work_dir: Path, cfg: TrainConfig, agent_build_kwargs: dict[str, tp.Any]):
     checkpoint_dir = work_dir / CHECKPOINT_DIR_NAME
     checkpoint_time = 0
+    train_status = {"time": 0, "buffer_time": None}
     if checkpoint_dir.exists():
         with (checkpoint_dir / "train_status.json").open("r") as f:
             train_status = json.load(f)
-        checkpoint_time = train_status["time"]
+        checkpoint_time = int(train_status["time"])
 
         print(f"Loading the agent at time {checkpoint_time}")
         agent = cfg.agent.object_class.load(checkpoint_dir, device=cfg.agent.model.device)
     else:
         agent = cfg.agent.build(**agent_build_kwargs)
-    return agent, cfg, checkpoint_time
+    return agent, cfg, checkpoint_time, train_status
 
 
 def init_wandb(cfg: TrainConfig):
@@ -361,6 +406,12 @@ def init_wandb(cfg: TrainConfig):
 class Workspace:
     def __init__(self, cfg: TrainConfig) -> None:
         self.cfg = cfg
+        requested_work_dir = Path(self.cfg.work_dir)
+        if self.cfg.resume_latest_run and not (requested_work_dir / CHECKPOINT_DIR_NAME).exists():
+            latest_run = _find_latest_resumable_run(requested_work_dir.parent, max_time=self.cfg.num_env_steps)
+            if latest_run is not None:
+                print(f"Resuming latest checkpointed run: {latest_run}")
+                self.cfg = self.cfg.model_copy(update={"work_dir": str(latest_run)})
 
         # HACK with Isaac, we can not recreate environments with current code, so we need to
         #      create the environment with desired number of envs here
@@ -396,7 +447,7 @@ class Workspace:
 
         set_seed_everywhere(self.cfg.seed)
 
-        self.agent, self.cfg, self._checkpoint_time = create_agent_or_load_checkpoint(
+        self.agent, self.cfg, self._checkpoint_time, self._train_status = create_agent_or_load_checkpoint(
             self.work_dir, self.cfg, agent_build_kwargs=dict(obs_space=self.obs_space, action_dim=self.action_dim)
         )
         self.agent._model.train()
@@ -427,11 +478,19 @@ class Workspace:
         self.training_with_expert_data = True
 
         self.manager = None
+        self._latest_train_timestep = self._checkpoint_time
+        self._latest_replay_buffer = None
+        self._latest_buffer_checkpoint_time = int(self._train_status.get("buffer_time") or 0)
 
     def train(self):
         self.start_time = time.time()
         try:
             self.train_online()
+        except KeyboardInterrupt:
+            if self._latest_replay_buffer is not None:
+                print(f"Interrupted. Saving latest checkpoint at time {self._latest_train_timestep}")
+                self.save(self._latest_train_timestep, self._latest_replay_buffer, save_buffer=False)
+            raise
         finally:
             self.tb_writer.close()
 
@@ -487,6 +546,7 @@ class Workspace:
                 replay_buffer["train"] = DictBuffer(capacity=self.cfg.buffer_size, device=self.cfg.buffer_device)
         if self.training_with_expert_data:
             replay_buffer["expert_slicer"] = expert_buffer
+        self._latest_replay_buffer = replay_buffer
 
         print("Starting training")
         progb = tqdm(total=self.cfg.num_env_steps, disable=self.cfg.disable_tqdm)
@@ -502,6 +562,7 @@ class Workspace:
         steps_since_last_log = 0
         train_time_total = 0.0
         checkpoint_time_checker = EveryNStepsChecker(self._checkpoint_time, self.cfg.checkpoint_every_steps)
+        buffer_checkpoint_time_checker = EveryNStepsChecker(self._checkpoint_time, self.cfg.checkpoint_buffer_every_steps)
         eval_time_checker = EveryNStepsChecker(self._checkpoint_time, self.cfg.eval_every_steps)
         update_agent_time_checker = EveryNStepsChecker(self._checkpoint_time, self.cfg.update_agent_every)
         log_time_checker = EveryNStepsChecker(self._checkpoint_time, self.cfg.log_every_updates)
@@ -513,9 +574,18 @@ class Workspace:
         uses_humanoidverse_eval = True if any(eval_instances) else False
 
         for t in range(self._checkpoint_time, self.cfg.num_env_steps + self.cfg.online_parallel_envs, self.cfg.online_parallel_envs):
-            if (t != self._checkpoint_time) and checkpoint_time_checker.check(t):
-                checkpoint_time_checker.update_last_step(t)
-                self.save(t, replay_buffer)
+            should_save_checkpoint = (t != self._checkpoint_time) and checkpoint_time_checker.check(t)
+            should_save_buffer = (
+                self.cfg.checkpoint_buffer
+                and (t != self._checkpoint_time)
+                and buffer_checkpoint_time_checker.check(t)
+            )
+            if should_save_checkpoint or should_save_buffer:
+                if should_save_checkpoint:
+                    checkpoint_time_checker.update_last_step(t)
+                if should_save_buffer:
+                    buffer_checkpoint_time_checker.update_last_step(t)
+                self.save(t, replay_buffer, save_buffer=should_save_buffer)
 
             if (self.evaluate and eval_time_checker.check(t)) or (self.evaluate and t == self._checkpoint_time):
                 eval_metrics = self.eval(t, replay_buffer=replay_buffer)
@@ -698,6 +768,9 @@ class Workspace:
                 interval_train_time = collection_time_acc + learning_time_acc
                 train_time_total += interval_train_time
                 interval_fps = steps_since_last_log / max(interval_train_time, 1e-9)
+                interval_iterations = max(steps_since_last_log // self.cfg.online_parallel_envs, 1)
+                avg_collection_time = collection_time_acc / interval_iterations
+                avg_learning_time = learning_time_acc / interval_iterations
                 total_train_steps = max(current_timestep - self._checkpoint_time, 0)
                 avg_train_fps = total_train_steps / max(train_time_total, 1e-9) if total_train_steps > 0 else interval_fps
                 grouped_metrics = _build_grouped_metrics(m_dict)
@@ -718,8 +791,8 @@ class Workspace:
                     iteration=current_iteration,
                     max_iterations=max_iterations,
                     steps_per_second=interval_fps,
-                    collection_time=collection_time_acc,
-                    learning_time=learning_time_acc,
+                    collection_time=avg_collection_time,
+                    learning_time=avg_learning_time,
                     elapsed_time=elapsed_time,
                     eta_seconds=eta_seconds,
                 )
@@ -727,8 +800,8 @@ class Workspace:
                     self.tb_writer,
                     grouped_metrics,
                     current_timestep,
-                    collection_time=collection_time_acc,
-                    learning_time=learning_time_acc,
+                    collection_time=avg_collection_time,
+                    learning_time=avg_learning_time,
                     elapsed_time=elapsed_time,
                     eta_seconds=eta_seconds,
                     iteration=current_iteration,
@@ -744,6 +817,7 @@ class Workspace:
                 self.train_logger.log(m_dict)
 
             progb.update(self.cfg.online_parallel_envs)
+            self._latest_train_timestep = min(t + self.cfg.online_parallel_envs, self.cfg.num_env_steps)
             td = new_td
             terminated = new_terminated
             truncated = new_truncated
@@ -799,13 +873,15 @@ class Workspace:
 
         return evaluation_results
 
-    def save(self, time: int, replay_buffer: Dict[str, tp.Any]) -> None:
-        print(f"Checkpointing at time {time}")
+    def save(self, time: int, replay_buffer: Dict[str, tp.Any], *, save_buffer: bool | None = None) -> None:
+        save_buffer = self.cfg.checkpoint_buffer if save_buffer is None else save_buffer
+        print(f"Checkpointing at time {time} (save_buffer={save_buffer})")
         self.agent.save(str(self.work_dir / CHECKPOINT_DIR_NAME))
-        if self.cfg.checkpoint_buffer:
+        if save_buffer:
             replay_buffer["train"].save(self.work_dir / CHECKPOINT_DIR_NAME / "buffers" / "train")
+            self._latest_buffer_checkpoint_time = time
         with (self.work_dir / CHECKPOINT_DIR_NAME / "train_status.json").open("w+") as f:
-            json.dump({"time": time}, f, indent=4)
+            json.dump({"time": time, "buffer_time": self._latest_buffer_checkpoint_time}, f, indent=4)
 
 
 def train_bfm_zero():
@@ -822,28 +898,28 @@ def train_bfm_zero():
             model=FBcprAuxModelConfig(
                 name='FBcprAuxModel',
                 device='cuda',
-                # archi=FBcprAuxModelArchiConfig(
-                #     name='FBcprAuxModelArchiConfig',
-                #     z_dim=256,
-                #     norm_z=True,
-                #     f=ForwardArchiConfig(name='ForwardArchi', hidden_dim=1024, model='residual', hidden_layers=4, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
-                #     b=BackwardArchiConfig(name='BackwardArchi', hidden_dim=256, hidden_layers=1, norm=True, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
-                #     actor=ActorArchiConfig(name='actor', model='residual', hidden_dim=1024, hidden_layers=4, embedding_layers=2, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'last_action', 'history_actor'])),
-                #     critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=1024, model='residual', hidden_layers=4, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
-                #     discriminator=DiscriminatorArchiConfig(name='DiscriminatorArchi', hidden_dim=512, hidden_layers=3, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
-                #     aux_critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=1024, model='residual', hidden_layers=4, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor']))
-                # ),
                 archi=FBcprAuxModelArchiConfig(
                     name='FBcprAuxModelArchiConfig',
                     z_dim=256,
                     norm_z=True,
-                    f=ForwardArchiConfig(name='ForwardArchi', hidden_dim=2048, model='residual', hidden_layers=6, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
+                    f=ForwardArchiConfig(name='ForwardArchi', hidden_dim=1024, model='residual', hidden_layers=4, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
                     b=BackwardArchiConfig(name='BackwardArchi', hidden_dim=256, hidden_layers=1, norm=True, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
-                    actor=ActorArchiConfig(name='actor', model='residual', hidden_dim=2048, hidden_layers=6, embedding_layers=2, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'last_action', 'history_actor'])),
-                    critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=2048, model='residual', hidden_layers=6, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
-                    discriminator=DiscriminatorArchiConfig(name='DiscriminatorArchi', hidden_dim=1024, hidden_layers=3, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
-                    aux_critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=2048, model='residual', hidden_layers=6, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor']))
+                    actor=ActorArchiConfig(name='actor', model='residual', hidden_dim=1024, hidden_layers=4, embedding_layers=2, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'last_action', 'history_actor'])),
+                    critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=1024, model='residual', hidden_layers=4, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
+                    discriminator=DiscriminatorArchiConfig(name='DiscriminatorArchi', hidden_dim=512, hidden_layers=3, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
+                    aux_critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=1024, model='residual', hidden_layers=4, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor']))
                 ),
+                # archi=FBcprAuxModelArchiConfig(
+                #     name='FBcprAuxModelArchiConfig',
+                #     z_dim=256,
+                #     norm_z=True,
+                #     f=ForwardArchiConfig(name='ForwardArchi', hidden_dim=2048, model='residual', hidden_layers=6, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
+                #     b=BackwardArchiConfig(name='BackwardArchi', hidden_dim=256, hidden_layers=1, norm=True, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
+                #     actor=ActorArchiConfig(name='actor', model='residual', hidden_dim=2048, hidden_layers=6, embedding_layers=2, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'last_action', 'history_actor'])),
+                #     critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=2048, model='residual', hidden_layers=6, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
+                #     discriminator=DiscriminatorArchiConfig(name='DiscriminatorArchi', hidden_dim=1024, hidden_layers=3, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
+                #     aux_critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=2048, model='residual', hidden_layers=6, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor']))
+                # ),
                 obs_normalizer=ObsNormalizerConfig(
                     name='ObsNormalizerConfig',
                     normalizers={
@@ -907,7 +983,9 @@ def train_bfm_zero():
             name='humanoidverse_isaac',
             device='cuda:0',
             # TODO this needs to be updated to point to a path with lafan dataset chunked into 10s clips
-            lafan_tail_path='humanoidverse/data/lafan_29dof_10s-clipped.pkl',
+            # lafan_tail_path='humanoidverse/data/lafan_29dof_10s-clipped.pkl',
+            # lafan_tail_path='humanoidverse/data/seed_train_10s_2000.pkl',
+            lafan_tail_path='humanoidverse/data/seed_train_10s_2000_jump08_pair_with_contact.pkl',
             enable_cameras=False,
             camera_render_save_dir='isaac_videos',
             max_episode_length_s=None,
@@ -922,18 +1000,22 @@ def train_bfm_zero():
             include_history_actor=True,
             include_history_noaction=False,
             make_config_g1env_compatible=False,
-            root_height_obs=True
+            root_height_obs=True,
+            use_contact_in_obs_max=True,
         ),
         work_dir=_make_timestamped_result_dir('results/bfmzero-isaac'),
         seed=42,
         online_parallel_envs=1024,
-        log_every_updates=1024,
+        log_every_updates=51200, # 50 iter * 1024 env steps/iter
         num_env_steps=384000000,
         update_agent_every=1024,
         num_seed_steps=10240,
         num_agent_updates=16,
         checkpoint_every_steps=9600000,
+        checkpoint_every_iterations=5000,
         checkpoint_buffer=True,
+        checkpoint_buffer_every_iterations=100000,
+        resume_latest_run=False,
         prioritization=True,
         prioritization_min_val=0.5,
         prioritization_max_val=2.0,

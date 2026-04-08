@@ -33,6 +33,15 @@ class LeggedRobotMotions(LeggedRobotBase):
         self._init_motion_extend()
         self._init_tracking_config()
         self.use_contact_in_obs_max = self.config.get("use_contact_in_obs_max", False)
+        self.contact_force_obs_threshold = float(self.config.get("contact_force_obs_threshold", 1.0))
+        self.foot_contact_obs_indices = torch.tensor(
+            [
+                self.simulator.find_rigid_body_indice(self.config.robot.left_foot_name),
+                self.simulator.find_rigid_body_indice(self.config.robot.right_foot_name),
+            ],
+            dtype=torch.long,
+            device=self.device,
+        )
         self.init_done = True
         self.debug_viz = True
         self.viewer_focus = False
@@ -357,8 +366,16 @@ class LeggedRobotMotions(LeggedRobotBase):
         if "max_local_self" in self.all_obs_name:
             with torch.no_grad():
                 if self.use_contact_in_obs_max:
-                    contact_binary = self.foot_contact_detect(self._rigid_body_pos_extend, self._rigid_body_vel_extend)
-                    max_local_self_dict = compute_humanoid_observations_max_with_contact(self._rigid_body_pos_extend, self._rigid_body_rot_extend, self._rigid_body_vel_extend, self._rigid_body_ang_vel_extend, True, self.config.obs.get("root_height_obs", True), contact_binary=contact_binary)
+                    contact_binary = self.get_sim_foot_contact_binary()
+                    max_local_self_dict = compute_humanoid_observations_max_with_contact(
+                        self._rigid_body_pos_extend,
+                        self._rigid_body_rot_extend,
+                        self._rigid_body_vel_extend,
+                        self._rigid_body_ang_vel_extend,
+                        True,
+                        self.config.obs.get("root_height_obs", True),
+                        contact_binary=contact_binary,
+                    )
                 else:
                     max_local_self_dict = compute_humanoid_observations_max(self._rigid_body_pos_extend, self._rigid_body_rot_extend, self._rigid_body_vel_extend, self._rigid_body_ang_vel_extend, True, self.config.obs.get("root_height_obs", True))
                 self._max_local_self = torch.cat([v for v in max_local_self_dict.values()], dim=-1)
@@ -366,10 +383,27 @@ class LeggedRobotMotions(LeggedRobotBase):
         if "max_local_ref" in self.all_obs_name:
             with torch.no_grad():
                 if self.use_contact_in_obs_max:
-                    contact_binary = self.foot_contact_detect(self.ref_body_pos_extend, self.ref_body_vel_extend)
-                    max_local_ref_dict = compute_humanoid_observations_max_with_contact(self.ref_body_pos_extend, self.ref_body_rot_extend, self.ref_body_vel_extend, self.ref_body_ang_vel_extend, True, True, self.feet_indices, contact_binary=contact_binary)
+                    contact_binary = motion_res.get("foot_contact_binary")
+                    if contact_binary is None:
+                        contact_binary = self.foot_contact_detect(self.ref_body_pos_extend, self.ref_body_vel_extend)
+                    max_local_ref_dict = compute_humanoid_observations_max_with_contact(
+                        self.ref_body_pos_extend,
+                        self.ref_body_rot_extend,
+                        self.ref_body_vel_extend,
+                        self.ref_body_ang_vel_extend,
+                        True,
+                        True,
+                        contact_binary=contact_binary,
+                    )
                 else:
-                    max_local_ref_dict = compute_humanoid_observations_max(self.ref_body_pos_extend, self.ref_body_rot_extend, self.ref_body_vel_extend, self.ref_body_ang_vel_extend, True, True, self.feet_indices)
+                    max_local_ref_dict = compute_humanoid_observations_max(
+                        self.ref_body_pos_extend,
+                        self.ref_body_rot_extend,
+                        self.ref_body_vel_extend,
+                        self.ref_body_ang_vel_extend,
+                        True,
+                        True,
+                    )
                 self._max_local_ref = torch.cat([v for v in max_local_ref_dict.values()], dim=-1)
                 
         # print(f"ref_motion_phase: {self._ref_motion_phase[0].item():.2f}")
@@ -590,7 +624,11 @@ class LeggedRobotMotions(LeggedRobotBase):
         height_thres = 0.07
         foot_speed = torch.norm(foot_vel, dim=-1)  # [num_envs, num_feet]
         contact_mask = (foot_speed < vel_thres) & (foot_height < height_thres)  # [num_envs, num_feet]
-        return contact_mask
+        return contact_mask.float()
+
+    def get_sim_foot_contact_binary(self):
+        contact_force_z = self.simulator.contact_forces[:, self.foot_contact_obs_indices, 2]
+        return (contact_force_z > self.contact_force_obs_threshold).float()
 
 
 @torch.jit.script

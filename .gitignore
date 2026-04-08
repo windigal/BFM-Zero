@@ -23,6 +23,8 @@ build/
 # 运行结果
 wandb/
 results/
+checkpoint/
+artifacts/
 
 # else
 *.pkl

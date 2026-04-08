@@ -37,6 +37,7 @@ dependencies = [
     "termcolor>=3.0.1",
     "torch==2.7.0",
     "torchvision==0.22.0",
+    "transformers>=4.53.1",
     "tyro>=0.9.18",
     "xxhash>=3.5.0",
 ]

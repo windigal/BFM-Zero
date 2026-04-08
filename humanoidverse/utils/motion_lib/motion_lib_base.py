@@ -261,6 +261,11 @@ class MotionLibBase():
             rg_rot_t = rb_rot
             body_vel_t = body_vel
             body_ang_vel_t = body_ang_vel
+
+        if "foot_contact_binary" in self.__dict__:
+            foot_contact_binary0 = self.foot_contact_binary[f0l]
+            foot_contact_binary1 = self.foot_contact_binary[f1l]
+            foot_contact_binary = ((1.0 - blend) * foot_contact_binary0 + blend * foot_contact_binary1 > 0.5).float()
             
         if self.smpl_data is not None:
             smpl_pose0 = self._motion_smpl_poses[f0l]
@@ -286,6 +291,8 @@ class MotionLibBase():
             "body_vel_t": body_vel_t.clone(),
             "body_ang_vel_t": body_ang_vel_t.clone(),
         })
+        if "foot_contact_binary" in self.__dict__:
+            return_dict["foot_contact_binary"] = foot_contact_binary.clone()
         return return_dict
     
     def load_motions_for_training(self, max_num_seqs = None):
@@ -336,6 +343,8 @@ class MotionLibBase():
             del self.gts, self.grs, self.lrs, self.grvs, self.gravs, self.gavs, self.gvs, self.dvs, self.dof_pos
             if "gts_t" in self.__dict__:
                 del self.gts_t, self.grs_t, self.gvs_t, self.gavs_t
+            if "foot_contact_binary" in self.__dict__:
+                del self.foot_contact_binary
                 
         
         motions = []
@@ -456,6 +465,8 @@ class MotionLibBase():
         
         if "dof_pos" in motions[0].__dict__:
             self.dof_pos = torch.cat([m.dof_pos for m in motions], dim=0).float().to(self._device)
+        if "foot_contact_binary" in motions[0].__dict__:
+            self.foot_contact_binary = torch.cat([m.foot_contact_binary for m in motions], dim=0).float().to(self._device)
         
         lengths = self._motion_num_frames
         lengths_shifted = lengths.roll(1)
@@ -548,6 +559,8 @@ class MotionLibBase():
                 # add "action" to curr_motion
                 if self.has_action:
                     curr_motion.action = to_torch(curr_file['action']).clone()[start:end]
+                if "foot_contact_binary" in curr_file:
+                    curr_motion.foot_contact_binary = to_torch(curr_file["foot_contact_binary"]).clone()[start:end].float()
                 res[curr_id] = (curr_file, curr_motion)
             else:
                 logger.error("No mesh parser found")

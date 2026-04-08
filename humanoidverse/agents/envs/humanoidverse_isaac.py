@@ -14,7 +14,11 @@ import torch
 import pydantic
 from gymnasium import Env
 from gymnasium.vector import VectorEnv
-from humanoidverse.envs.legged_robot_motions.legged_robot_motions import LeggedRobotMotions, compute_humanoid_observations_max
+from humanoidverse.envs.legged_robot_motions.legged_robot_motions import (
+    LeggedRobotMotions,
+    compute_humanoid_observations_max,
+    compute_humanoid_observations_max_with_contact,
+)
 from humanoidverse.utils.helpers import pre_process_config
 from humanoidverse.utils.torch_utils import quat_rotate_inverse
 from omegaconf import OmegaConf
@@ -59,14 +63,28 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
 
         # construct observation
         # TODO is this aligned with the environment observation logic?
-        obs_dict = compute_humanoid_observations_max(
-            ref_body_pos,
-            ref_body_rots,
-            ref_body_vels,
-            ref_body_angular_vels,
-            local_root_obs=True,
-            root_height_obs=env.config.obs.root_height_obs,
-        )
+        if env.use_contact_in_obs_max:
+            contact_binary = motion_res.get("foot_contact_binary")
+            if contact_binary is None:
+                contact_binary = env.foot_contact_detect(ref_body_pos, ref_body_vels)
+            obs_dict = compute_humanoid_observations_max_with_contact(
+                ref_body_pos,
+                ref_body_rots,
+                ref_body_vels,
+                ref_body_angular_vels,
+                local_root_obs=True,
+                root_height_obs=env.config.obs.root_height_obs,
+                contact_binary=contact_binary,
+            )
+        else:
+            obs_dict = compute_humanoid_observations_max(
+                ref_body_pos,
+                ref_body_rots,
+                ref_body_vels,
+                ref_body_angular_vels,
+                local_root_obs=True,
+                root_height_obs=env.config.obs.root_height_obs,
+            )
         max_local_self_obs = torch.cat([v for v in obs_dict.values()], dim=-1)
 
         # Aligned with the logic below to create proprio state
@@ -599,6 +617,7 @@ class HumanoidVerseIsaacConfig(BaseConfig):
     make_config_g1env_compatible: bool = False
 
     root_height_obs: bool = False
+    use_contact_in_obs_max: bool = False
 
     def build(self, num_envs: int = 1) -> tp.Tuple[HumanoidVerseVectorEnv, tp.Any]:
         global _humanoidverse_env_singleton
@@ -640,6 +659,7 @@ class HumanoidVerseIsaacConfig(BaseConfig):
         cfg.robot.asset.asset_root = cfg.robot.asset.asset_root.replace("humanoidverse", HUMANOIDVERSE_DIR)
         cfg.robot.motion.asset.assetRoot = cfg.robot.motion.asset.assetRoot.replace("humanoidverse", HUMANOIDVERSE_DIR)
         cfg.robot.motion.motion_file = self.lafan_tail_path
+        OmegaConf.update(cfg, "env.config.use_contact_in_obs_max", self.use_contact_in_obs_max, force_add=True)
 
         # This sets obs/action dims etc
         pre_process_config(cfg)

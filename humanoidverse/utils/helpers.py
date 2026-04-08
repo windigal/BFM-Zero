@@ -46,6 +46,10 @@ def pre_process_config(config) -> None:
     if isinstance(config.env.config.obs.obs_dims, ListConfig):
         each_dict_obs_dims = {k: v for d in config.env.config.obs.obs_dims for k, v in d.items()}
         config.env.config.obs.obs_dims = each_dict_obs_dims
+    if config.env.config.get("use_contact_in_obs_max", False):
+        if "max_local_self" not in config.env.config.obs.obs_dims:
+            raise KeyError("Expected obs_dims to contain 'max_local_self' when use_contact_in_obs_max=True")
+        config.env.config.obs.obs_dims["max_local_self"] = int(config.env.config.obs.obs_dims["max_local_self"]) + 2
     logger.info(f"obs_dims: {config.env.config.obs.obs_dims}")
     auxiliary_obs_dims = {}
     for aux_obs_key, aux_config in _aux_obs_key_list.items():
@@ -172,7 +176,9 @@ def get_backward_observation(env, motion_id, use_root_height_obs: bool = False, 
 
     # construct observation
     if env.use_contact_in_obs_max:
-        contact_binary = env.foot_contact_detect(ref_body_pos, ref_body_vels)
+        contact_binary = motion_state.get("foot_contact_binary")
+        if contact_binary is None:
+            contact_binary = env.foot_contact_detect(ref_body_pos, ref_body_vels)
         obs_dict = compute_humanoid_observations_max_with_contact(
             ref_body_pos,
             ref_body_rots,
@@ -241,7 +247,20 @@ def export_meta_policy_as_onnx(inference_model, path, exported_policy_name, exam
     os.makedirs(path, exist_ok=True)
     path = os.path.join(path, exported_policy_name)
     inference_model = inference_model.eval()
-    actor = copy.deepcopy(inference_model).to("cpu")
+    # Force export in fp32. Some trained checkpoints contain bf16 params/buffers,
+    # which produce ONNX graphs that onnxruntime in deploy cannot load.
+    actor = copy.deepcopy(inference_model).to("cpu").float()
+    for module in actor.modules():
+        if hasattr(module, "device"):
+            module.device = "cpu"
+        if hasattr(module, "amp_dtype"):
+            module.amp_dtype = torch.float32
+        cfg = getattr(module, "cfg", None)
+        if cfg is not None and hasattr(cfg, "amp"):
+            try:
+                object.__setattr__(cfg, "amp", False)
+            except Exception:
+                cfg.amp = False
 
     class PPOWrapper(nn.Module):
         def __init__(self, actor, history):
@@ -276,13 +295,14 @@ def export_meta_policy_as_onnx(inference_model, path, exported_policy_name, exam
             return self.actor.act(actor_dict, ctx)
 
     wrapper = PPOWrapper(actor, history=history)
-    example_input_list = example_obs_dict["actor_obs"]
-    torch.onnx.export(
-        wrapper,
-        example_input_list,  # Pass x1 and x2 as separate inputs
-        path,
-        verbose=True,
-        input_names=["actor_obs"],  # Specify the input names
-        output_names=["action"],  # Name the output
-        opset_version=13,  # Specify the opset version, if needed
-    )
+    example_input_list = example_obs_dict["actor_obs"].to(dtype=torch.float32, device="cpu")
+    with torch.autocast(device_type="cpu", enabled=False):
+        torch.onnx.export(
+            wrapper,
+            example_input_list,  # Pass x1 and x2 as separate inputs
+            path,
+            verbose=True,
+            input_names=["actor_obs"],  # Specify the input names
+            output_names=["action"],  # Name the output
+            opset_version=13,  # Specify the opset version, if needed
+        )

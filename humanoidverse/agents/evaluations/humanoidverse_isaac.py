@@ -198,7 +198,9 @@ def get_backward_observation(env, motion_id, include_last_action, velocity_multi
 
     # construct observation
     if env.use_contact_in_obs_max:
-        contact_binary = env.foot_contact_detect(ref_body_pos, ref_body_vels)
+        contact_binary = motion_state.get("foot_contact_binary")
+        if contact_binary is None:
+            contact_binary = env.foot_contact_detect(ref_body_pos, ref_body_vels)
         obs_dict = compute_humanoid_observations_max_with_contact(
             ref_body_pos,
             ref_body_rots,
