@@ -112,13 +112,40 @@ class FBcprAuxAgent(FBcprAgent):
         expert_z = self.encode_expert(next_obs=expert_next_obs)
         train_z = train_batch["z"].to(self.device)
 
+        disc_seq_length = self._get_discriminator_num_obs_steps()
+        if disc_seq_length > 1:
+            temporal_disc_inputs = self._prepare_temporal_discriminator_inputs(replay_buffer)
+            disc_expert_obs = temporal_disc_inputs["expert_obs"]
+            disc_expert_z = temporal_disc_inputs["expert_z"]
+            disc_train_obs = temporal_disc_inputs["train_obs"]
+            disc_train_z = temporal_disc_inputs["train_z"]
+            critic_obs = temporal_disc_inputs["critic_obs"]
+            critic_action = temporal_disc_inputs["critic_action"]
+            critic_discount = temporal_disc_inputs["critic_discount"]
+            critic_next_obs = temporal_disc_inputs["critic_next_obs"]
+            critic_z = temporal_disc_inputs["critic_z"]
+            critic_reward_obs = disc_train_obs
+            critic_reward_z = disc_train_z
+        else:
+            disc_expert_obs = expert_obs
+            disc_expert_z = expert_z
+            disc_train_obs = train_obs
+            disc_train_z = train_z
+            critic_obs = train_obs
+            critic_action = train_action
+            critic_discount = discount
+            critic_next_obs = train_next_obs
+            critic_z = train_z
+            critic_reward_obs = None
+            critic_reward_z = None
+
         # train the discriminator
         grad_penalty = self.cfg.train.grad_penalty_discriminator if self.cfg.train.grad_penalty_discriminator > 0 else None
         metrics = self.update_discriminator(
-            expert_obs=expert_obs,
-            expert_z=expert_z,
-            train_obs=train_obs,
-            train_z=train_z,
+            expert_obs=disc_expert_obs,
+            expert_z=disc_expert_z,
+            train_obs=disc_train_obs,
+            train_z=disc_train_z,
             grad_penalty=grad_penalty,
         )
 
@@ -146,11 +173,13 @@ class FBcprAuxAgent(FBcprAgent):
         )
         metrics.update(
             self.update_critic(
-                obs=train_obs,
-                action=train_action,
-                discount=discount,
-                next_obs=train_next_obs,
-                z=train_z,
+                obs=critic_obs,
+                action=critic_action,
+                discount=critic_discount,
+                next_obs=critic_next_obs,
+                z=critic_z,
+                reward_obs=critic_reward_obs,
+                reward_z=critic_reward_z,
             )
         )
         # compute scalar auxiliary reward as a weighted sum of the auxiliary rewards

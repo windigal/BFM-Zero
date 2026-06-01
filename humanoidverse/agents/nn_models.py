@@ -166,6 +166,7 @@ class DiscriminatorArchiConfig(BaseConfig):
     name: tp.Literal["DiscriminatorArchi"] = "DiscriminatorArchi"
     hidden_dim: int = 1024
     hidden_layers: int = 2
+    num_obs_steps: int = 1
     input_filter: NNFilter = IdentityInputFilterConfig()
 
     def build(self, obs_space, z_dim) -> "Discriminator":
@@ -345,7 +346,7 @@ class Discriminator(nn.Module):
             f"filtered_space must be a Box space, got {type(filtered_space)}. Did you forget to set input_filter?"
         )
         assert len(filtered_space.shape) == 1, "filtered_space must have a 1D shape"
-        obs_dim = filtered_space.shape[0]
+        obs_dim = filtered_space.shape[0] * cfg.num_obs_steps
         seq = [nn.Linear(obs_dim + z_dim, cfg.hidden_dim), nn.LayerNorm(cfg.hidden_dim), nn.Tanh()]
         for _ in range(cfg.hidden_layers - 1):
             seq += [nn.Linear(cfg.hidden_dim, cfg.hidden_dim), nn.ReLU()]
@@ -358,6 +359,8 @@ class Discriminator(nn.Module):
 
     def compute_logits(self, obs: torch.Tensor | dict[str, torch.Tensor], z: torch.Tensor) -> torch.Tensor:
         obs = self.input_filter(obs)
+        if obs.ndim > 2:
+            obs = obs.flatten(start_dim=1)
         x = torch.cat([z, obs], dim=1)
         logits = self.trunk(x)
         return logits

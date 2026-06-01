@@ -343,6 +343,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-jump-ratio", type=float, default=0.10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--root-euler-order", type=str, default="xyz")
+    parser.add_argument("--target-fps", type=int, default=30)
     parser.add_argument("--include-foot-contact-binary", action="store_true", default=True)
     parser.add_argument("--no-include-foot-contact-binary", dest="include_foot_contact_binary", action="store_false")
     parser.add_argument("--contact-dataset-root", type=Path, default=Path("/home/hanwei/dataset/LAFAN1/g1_seed"))
@@ -373,7 +374,7 @@ def main() -> None:
     motion_dict = manifest_records_to_motion_dict(
         records=selected_records,
         mjcf_path=args.mjcf_path,
-        target_fps=30,
+        target_fps=int(args.target_fps),
         root_euler_order=args.root_euler_order,
         include_foot_contact_binary=bool(args.include_foot_contact_binary),
         contact_dataset_root=args.contact_dataset_root,
@@ -394,6 +395,7 @@ def main() -> None:
             "reference_manifest": str(args.reference_manifest.resolve()),
             "output_manifest": str(args.output_manifest.resolve()),
             "output_motionlib": str(args.output_motionlib.resolve()),
+            "target_fps": int(args.target_fps),
             "include_foot_contact_binary": bool(args.include_foot_contact_binary),
             "contact_dataset_root": str(args.contact_dataset_root.resolve()),
             "jump_classifier": {

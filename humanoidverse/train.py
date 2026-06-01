@@ -54,6 +54,7 @@ REWARD_EVAL_LOG_FILENAME = "reward_eval_log.csv"
 TRACKING_EVAL_LOG_FILENAME = "tracking_eval_log.csv"
 
 CHECKPOINT_DIR_NAME = "checkpoint"
+WANDB_RUN_INFO_FILENAME = "wandb_run.json"
 
 TRAIN_METRIC_GROUPS = OrderedDict(
     [
@@ -396,11 +397,52 @@ def create_agent_or_load_checkpoint(work_dir: Path, cfg: TrainConfig, agent_buil
     return agent, cfg, checkpoint_time, train_status
 
 
-def init_wandb(cfg: TrainConfig):
+def _read_wandb_run_info(work_dir: Path) -> dict[str, tp.Any] | None:
+    info_path = work_dir / WANDB_RUN_INFO_FILENAME
+    if not info_path.exists():
+        return None
+    try:
+        with info_path.open("r") as f:
+            info = json.load(f)
+        if not isinstance(info, dict):
+            return None
+        return info
+    except Exception:
+        return None
+
+
+def _write_wandb_run_info(work_dir: Path, run: tp.Any) -> None:
+    info_path = work_dir / WANDB_RUN_INFO_FILENAME
+    payload = {
+        "id": run.id,
+        "name": run.name,
+        "project": run.project,
+        "entity": run.entity,
+        "group": run.group,
+        "url": run.url,
+    }
+    with info_path.open("w") as f:
+        json.dump(payload, f, indent=4)
+
+
+def init_wandb(cfg: TrainConfig, work_dir: Path):
     exp_name = "BFM-Zero"
     wandb_name = exp_name
     wandb_config = cfg.model_dump()
-    wandb.init(entity=cfg.wandb_ename, project=cfg.wandb_pname, group=cfg.wandb_gname, name=wandb_name, config=wandb_config, dir="./_wandb")
+    existing_run_info = _read_wandb_run_info(work_dir)
+    init_kwargs = dict(
+        entity=cfg.wandb_ename,
+        project=cfg.wandb_pname,
+        group=cfg.wandb_gname,
+        name=(existing_run_info or {}).get("name", wandb_name),
+        config=wandb_config,
+        dir="./_wandb",
+    )
+    if existing_run_info is not None and existing_run_info.get("id"):
+        init_kwargs["id"] = existing_run_info["id"]
+        init_kwargs["resume"] = "must"
+    run = wandb.init(**init_kwargs)
+    _write_wandb_run_info(work_dir, run)
 
 
 class Workspace:
@@ -461,7 +503,7 @@ class Workspace:
         self.eval_loggers = {name: CSVLogger(filename=self.work_dir / f"{name}.csv") for name in self.evaluations.keys()}
 
         if self.cfg.use_wandb:
-            init_wandb(self.cfg)
+            init_wandb(self.cfg, self.work_dir)
 
         with (self.work_dir / "config.json").open("w") as f:
             f.write(self.cfg.model_dump_json(indent=4))
@@ -493,6 +535,8 @@ class Workspace:
             raise
         finally:
             self.tb_writer.close()
+            if self.cfg.use_wandb and wandb.run is not None:
+                wandb.finish()
 
     def train_online(self) -> None:
         if self.training_with_expert_data:
@@ -906,7 +950,7 @@ def train_bfm_zero():
                     b=BackwardArchiConfig(name='BackwardArchi', hidden_dim=256, hidden_layers=1, norm=True, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
                     actor=ActorArchiConfig(name='actor', model='residual', hidden_dim=1024, hidden_layers=4, embedding_layers=2, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'last_action', 'history_actor'])),
                     critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=1024, model='residual', hidden_layers=4, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
-                    discriminator=DiscriminatorArchiConfig(name='DiscriminatorArchi', hidden_dim=512, hidden_layers=3, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
+                    discriminator=DiscriminatorArchiConfig(name='DiscriminatorArchi', hidden_dim=512, hidden_layers=3, num_obs_steps=1, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
                     aux_critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=1024, model='residual', hidden_layers=4, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor']))
                 ),
                 # archi=FBcprAuxModelArchiConfig(
@@ -985,7 +1029,8 @@ def train_bfm_zero():
             # TODO this needs to be updated to point to a path with lafan dataset chunked into 10s clips
             # lafan_tail_path='humanoidverse/data/lafan_29dof_10s-clipped.pkl',
             # lafan_tail_path='humanoidverse/data/seed_train_10s_2000.pkl',
-            lafan_tail_path='humanoidverse/data/seed_train_10s_2000_jump08_pair_with_contact.pkl',
+            # lafan_tail_path='humanoidverse/data/seed_train_10s_2000_jump08_pair_with_contact.pkl',
+            lafan_tail_path='humanoidverse/data/babel_train_seed2k_windowed_2000_10s_50fps.pkl',
             enable_cameras=False,
             camera_render_save_dir='isaac_videos',
             max_episode_length_s=None,
@@ -1001,7 +1046,7 @@ def train_bfm_zero():
             include_history_noaction=False,
             make_config_g1env_compatible=False,
             root_height_obs=True,
-            use_contact_in_obs_max=True,
+            use_contact_in_obs_max=False,
         ),
         work_dir=_make_timestamped_result_dir('results/bfmzero-isaac'),
         seed=42,

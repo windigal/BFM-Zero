@@ -30,6 +30,7 @@ def get_default_fbcpr_config_as_a_dict():
                     "discriminator": {
                         "hidden_dim": 1024,
                         "hidden_layers": 3,
+                        "num_obs_steps": 5,
                     },
                     "z_dim": 256,
                     "norm_z": True,

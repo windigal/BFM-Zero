@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
 
 
 SEED_TEXT_FIELDS = (
@@ -672,10 +672,8 @@ def build_fixed_length_clip_records(
     if clip_step_s is not None and clip_step_s <= 0:
         raise ValueError("clip_step_s must be > 0")
 
-    stride = max(1, round(source_fps / target_fps))
-    target_fps = int(source_fps / stride)
     target_clip_frames = int(round(clip_length_s * target_fps))
-    source_clip_frames = target_clip_frames * stride
+    source_clip_frames = int(round(clip_length_s * source_fps))
     source_step_frames = source_clip_frames if clip_step_s is None else int(round(clip_step_s * source_fps))
     if source_step_frames <= 0:
         raise ValueError("Computed non-positive source_step_frames")
@@ -819,6 +817,39 @@ def load_seed_g1_rows(
     return rows
 
 
+def _compute_resampled_frame_count(num_source_frames: int, source_fps: int, target_fps: int) -> int:
+    if num_source_frames <= 0:
+        raise ValueError(f"num_source_frames must be > 0, got {num_source_frames}")
+    if source_fps <= 0 or target_fps <= 0:
+        raise ValueError(f"source_fps and target_fps must be > 0, got {source_fps}, {target_fps}")
+    return max(1, int(round(num_source_frames * float(target_fps) / float(source_fps))))
+
+
+def _resample_linear(values: np.ndarray, source_times: np.ndarray, target_times: np.ndarray) -> np.ndarray:
+    flat_values = values.reshape(values.shape[0], -1).astype(np.float64, copy=False)
+    resampled = np.empty((target_times.shape[0], flat_values.shape[1]), dtype=np.float32)
+    for col_idx in range(flat_values.shape[1]):
+        resampled[:, col_idx] = np.interp(target_times, source_times, flat_values[:, col_idx]).astype(np.float32)
+    return resampled.reshape((target_times.shape[0],) + values.shape[1:])
+
+
+def _resample_quaternions_xyzw(quaternions_xyzw: np.ndarray, source_times: np.ndarray, target_times: np.ndarray) -> np.ndarray:
+    rotations = Rotation.from_quat(quaternions_xyzw.astype(np.float64, copy=False))
+    slerp = Slerp(source_times, rotations)
+    resampled = slerp(target_times).as_quat().astype(np.float32)
+    resampled /= np.linalg.norm(resampled, axis=-1, keepdims=True) + 1e-8
+    return resampled
+
+
+def _resample_binary_nearest(values: np.ndarray, source_times: np.ndarray, target_times: np.ndarray) -> np.ndarray:
+    right_idx = np.searchsorted(source_times, target_times, side="left")
+    right_idx = np.clip(right_idx, 0, len(source_times) - 1)
+    left_idx = np.clip(right_idx - 1, 0, len(source_times) - 1)
+    choose_right = np.abs(source_times[right_idx] - target_times) < np.abs(target_times - source_times[left_idx])
+    nearest_idx = np.where(choose_right, right_idx, left_idx)
+    return values[nearest_idx]
+
+
 def resolve_seed_g1_contact_csv_path(motion_csv_path: Path, contact_dataset_root: Path) -> Path:
     contact_csv_path = contact_dataset_root / motion_csv_path.parent.name / motion_csv_path.name
     if not contact_csv_path.exists():
@@ -855,6 +886,7 @@ def seed_rows_to_motion_entry(
     rows: list[dict[str, str]],
     joint_axes: np.ndarray,
     target_fps: int,
+    source_fps: int = SEED_SOURCE_FPS,
     root_euler_order: str = "xyz",
     foot_contact_binary: np.ndarray | None = None,
 ) -> dict[str, np.ndarray | int]:
@@ -893,6 +925,25 @@ def seed_rows_to_motion_entry(
     root_positions_np = np.stack(root_positions, axis=0)
     root_quats_np = np.stack(root_quats, axis=0)
     dof_values_np = np.stack(dof_values, axis=0)
+
+    if source_fps != target_fps:
+        num_target_frames = _compute_resampled_frame_count(
+            num_source_frames=root_positions_np.shape[0],
+            source_fps=source_fps,
+            target_fps=target_fps,
+        )
+        source_times = np.arange(root_positions_np.shape[0], dtype=np.float64) / float(source_fps)
+        target_times = np.arange(num_target_frames, dtype=np.float64) / float(target_fps)
+        root_positions_np = _resample_linear(root_positions_np, source_times, target_times).astype(np.float32)
+        dof_values_np = _resample_linear(dof_values_np, source_times, target_times).astype(np.float32)
+        root_quats_np = _resample_quaternions_xyzw(root_quats_np, source_times, target_times).astype(np.float32)
+        if foot_contact_binary is not None:
+            foot_contact_binary = _resample_binary_nearest(
+                foot_contact_binary.astype(np.float32, copy=False),
+                source_times,
+                target_times,
+            ).astype(np.float32)
+
     root_rotvec_np = np.stack([quaternion_xyzw_to_rotvec(q) for q in root_quats_np], axis=0)
     local_joint_rotvec = dof_values_np[..., None] * joint_axes[None, ...]
     pose_aa = np.concatenate([root_rotvec_np[:, None, :], local_joint_rotvec], axis=1).astype(np.float32)
@@ -920,8 +971,13 @@ def manifest_records_to_motion_dict(
     include_foot_contact_binary: bool = False,
     contact_dataset_root: Path | None = None,
 ) -> dict[str, dict[str, np.ndarray | int]]:
-    stride = max(1, round(SEED_SOURCE_FPS / target_fps))
-    target_fps = int(SEED_SOURCE_FPS / stride)
+    if target_fps <= 0:
+        raise ValueError(f"target_fps must be > 0, got {target_fps}")
+    exact_stride = 1
+    source_rows_fps = SEED_SOURCE_FPS
+    if SEED_SOURCE_FPS % int(target_fps) == 0:
+        exact_stride = SEED_SOURCE_FPS // int(target_fps)
+        source_rows_fps = int(target_fps)
     joint_axes = parse_joint_axes(mjcf_path)
     motion_dict: dict[str, dict[str, np.ndarray | int]] = {}
 
@@ -931,7 +987,7 @@ def manifest_records_to_motion_dict(
             csv_path=motion_csv_path,
             start_frame=int(record["start_frame"]),
             end_frame=int(record["end_frame"]),
-            stride=stride,
+            stride=exact_stride,
         )
         if len(rows) < 2:
             continue
@@ -944,12 +1000,13 @@ def manifest_records_to_motion_dict(
                 csv_path=contact_csv_path,
                 start_frame=int(record["start_frame"]),
                 end_frame=int(record["end_frame"]),
-                stride=stride,
+                stride=exact_stride,
             )
         motion_entry = seed_rows_to_motion_entry(
             rows,
             joint_axes=joint_axes,
             target_fps=target_fps,
+            source_fps=source_rows_fps,
             root_euler_order=root_euler_order,
             foot_contact_binary=foot_contact_binary,
         )

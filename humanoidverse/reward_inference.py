@@ -29,7 +29,23 @@ if getattr(humanoidverse, "__file__", None) is not None:
 else:
     HUMANOIDVERSE_DIR = Path(__file__).parent.parent.parent
 
-def main(model_folder: Path, data_path: Path | None = None, headless: bool = True, device="cuda", simulator: str = "isaacsim", save_mp4: bool=False, episode_length: int=500, video_folder: str | None = None, disable_dr: bool = False, disable_obs_noise: bool = False, num_samples: int = 150_000, n_inferences: int = 1, skip_rollouts: bool = False):
+def main(
+    model_folder: Path,
+    data_path: Path | None = None,
+    headless: bool = True,
+    device="cuda",
+    simulator: str = "isaacsim",
+    save_mp4: bool = False,
+    episode_length: int = 500,
+    video_folder: str | None = None,
+    disable_dr: bool = False,
+    disable_obs_noise: bool = False,
+    num_samples: int = 150_000,
+    n_inferences: int = 1,
+    skip_rollouts: bool = False,
+    max_workers: int = 24,
+    process_executor: bool = True,
+):
     model_folder = Path(model_folder)
     video_folder = Path(video_folder) if video_folder is not None else model_folder / "reward_inference" / "videos"
     video_folder.mkdir(parents=True, exist_ok=True)
@@ -162,8 +178,8 @@ def main(model_folder: Path, data_path: Path | None = None, headless: bool = Tru
         inference_dataset=dataset,
         num_samples_per_inference=num_samples,
         inference_function=inference_function,
-        max_workers=24,
-        process_executor=True,
+        max_workers=max_workers,
+        process_executor=process_executor,
         env_model=str(HUMANOIDVERSE_DIR / "data" / "robots" / "g1" / "scene_29dof_freebase_noadditional_actuators.xml"),
     )
     z_dict = {}

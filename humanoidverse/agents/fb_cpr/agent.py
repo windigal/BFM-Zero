@@ -123,6 +123,95 @@ class FBcprAgent(FBAgent):
             self.update_discriminator = CudaGraphModule(self.update_discriminator, warmup=5)
             self.encode_expert = CudaGraphModule(self.encode_expert, warmup=5)
 
+    def _get_discriminator_num_obs_steps(self) -> int:
+        return max(1, int(getattr(self._model._discriminator.cfg, "num_obs_steps", 1)))
+
+    def _get_discriminator_batch_size(self) -> int:
+        num_obs_steps = self._get_discriminator_num_obs_steps()
+        if num_obs_steps == 1:
+            return self.cfg.train.batch_size
+        batch_size = (self.cfg.train.batch_size // num_obs_steps) * num_obs_steps
+        if batch_size == 0:
+            raise ValueError(
+                f"batch_size={self.cfg.train.batch_size} must be at least discriminator.num_obs_steps={num_obs_steps}"
+            )
+        return batch_size
+
+    @staticmethod
+    def _reshape_sequence_tensor(x: torch.Tensor, seq_length: int) -> torch.Tensor:
+        if x.shape[0] % seq_length != 0:
+            raise ValueError(f"Leading batch dim {x.shape[0]} must be divisible by seq_length={seq_length}")
+        return x.view(x.shape[0] // seq_length, seq_length, *x.shape[1:])
+
+    @classmethod
+    def _flatten_sequence_obs(cls, obs: torch.Tensor | dict[str, torch.Tensor], seq_length: int):
+        return tree_map(lambda x: cls._reshape_sequence_tensor(x, seq_length).flatten(start_dim=1), obs)
+
+    @classmethod
+    def _last_sequence_step(cls, data: torch.Tensor | dict[str, torch.Tensor], seq_length: int):
+        return tree_map(lambda x: cls._reshape_sequence_tensor(x, seq_length)[:, -1], data)
+
+    @torch.no_grad()
+    def _encode_expert_sequences(
+        self,
+        next_obs: torch.Tensor | dict[str, torch.Tensor],
+        seq_length: int,
+    ) -> torch.Tensor:
+        with autocast(device_type=self.device, dtype=self._model.amp_dtype, enabled=self.cfg.model.amp):
+            expert_encodings = self._model._backward_map(next_obs).detach()
+            expert_encodings = self._reshape_sequence_tensor(expert_encodings, seq_length)
+            expert_z = self._model.project_z(expert_encodings.mean(dim=1))
+        return expert_z
+
+    def _prepare_temporal_discriminator_inputs(self, replay_buffer):
+        seq_length = self._get_discriminator_num_obs_steps()
+        batch_size = self._get_discriminator_batch_size()
+
+        expert_batch = replay_buffer["expert_slicer"].sample(batch_size, seq_length=seq_length)
+        train_batch = replay_buffer["train"].sample(batch_size, seq_length=seq_length)
+
+        train_obs, train_action, train_next_obs, train_z = (
+            tree_map(lambda x: x.to(self.device), train_batch["observation"]),
+            train_batch["action"].to(self.device),
+            tree_map(lambda x: x.to(self.device), train_batch["next"]["observation"]),
+            train_batch["z"].to(self.device),
+        )
+        train_terminated = train_batch["next"]["terminated"].to(self.device)
+        expert_obs, expert_next_obs = (
+            tree_map(lambda x: x.to(self.device), expert_batch["observation"]),
+            tree_map(lambda x: x.to(self.device), expert_batch["next"]["observation"]),
+        )
+
+        self._model._obs_normalizer(train_obs)
+        self._model._obs_normalizer(train_next_obs)
+
+        with torch.no_grad(), eval_mode(self._model._obs_normalizer):
+            train_obs, train_next_obs = (
+                self._model._obs_normalizer(train_obs),
+                self._model._obs_normalizer(train_next_obs),
+            )
+            expert_obs, expert_next_obs = (
+                self._model._obs_normalizer(expert_obs),
+                self._model._obs_normalizer(expert_next_obs),
+            )
+
+        train_obs_disc = self._flatten_sequence_obs(train_obs, seq_length)
+        expert_obs_disc = self._flatten_sequence_obs(expert_obs, seq_length)
+        train_z_disc = self._last_sequence_step(train_z, seq_length)
+        expert_z_disc = self._encode_expert_sequences(expert_next_obs, seq_length)
+
+        return {
+            "expert_obs": expert_obs_disc,
+            "expert_z": expert_z_disc,
+            "train_obs": train_obs_disc,
+            "train_z": train_z_disc,
+            "critic_obs": self._last_sequence_step(train_obs, seq_length),
+            "critic_action": self._last_sequence_step(train_action, seq_length),
+            "critic_discount": self.cfg.train.discount * ~self._last_sequence_step(train_terminated, seq_length),
+            "critic_next_obs": self._last_sequence_step(train_next_obs, seq_length),
+            "critic_z": train_z_disc,
+        }
+
     @torch.no_grad()
     def sample_mixed_z(self, train_goal: torch.Tensor, expert_encodings: torch.Tensor, *args, **kwargs):
         with autocast(device_type=self.device, dtype=self._model.amp_dtype, enabled=self.cfg.model.amp):
@@ -199,13 +288,40 @@ class FBcprAgent(FBAgent):
         expert_z = self.encode_expert(next_obs=expert_next_obs)
         train_z = train_batch["z"].to(self.device)
 
+        disc_seq_length = self._get_discriminator_num_obs_steps()
+        if disc_seq_length > 1:
+            temporal_disc_inputs = self._prepare_temporal_discriminator_inputs(replay_buffer)
+            disc_expert_obs = temporal_disc_inputs["expert_obs"]
+            disc_expert_z = temporal_disc_inputs["expert_z"]
+            disc_train_obs = temporal_disc_inputs["train_obs"]
+            disc_train_z = temporal_disc_inputs["train_z"]
+            critic_obs = temporal_disc_inputs["critic_obs"]
+            critic_action = temporal_disc_inputs["critic_action"]
+            critic_discount = temporal_disc_inputs["critic_discount"]
+            critic_next_obs = temporal_disc_inputs["critic_next_obs"]
+            critic_z = temporal_disc_inputs["critic_z"]
+            critic_reward_obs = disc_train_obs
+            critic_reward_z = disc_train_z
+        else:
+            disc_expert_obs = expert_obs
+            disc_expert_z = expert_z
+            disc_train_obs = train_obs
+            disc_train_z = train_z
+            critic_obs = train_obs
+            critic_action = train_action
+            critic_discount = discount
+            critic_next_obs = train_next_obs
+            critic_z = train_z
+            critic_reward_obs = None
+            critic_reward_z = None
+
         # train the discriminator
         grad_penalty = self.cfg.train.grad_penalty_discriminator if self.cfg.train.grad_penalty_discriminator > 0 else None
         metrics = self.update_discriminator(
-            expert_obs=expert_obs,
-            expert_z=expert_z,
-            train_obs=train_obs,
-            train_z=train_z,
+            expert_obs=disc_expert_obs,
+            expert_z=disc_expert_z,
+            train_obs=disc_train_obs,
+            train_z=disc_train_z,
             grad_penalty=grad_penalty,
         )
 
@@ -233,11 +349,13 @@ class FBcprAgent(FBAgent):
         )
         metrics.update(
             self.update_critic(
-                obs=train_obs,
-                action=train_action,
-                discount=discount,
-                next_obs=train_next_obs,
-                z=train_z,
+                obs=critic_obs,
+                action=critic_action,
+                discount=critic_discount,
+                next_obs=critic_next_obs,
+                z=critic_z,
+                reward_obs=critic_reward_obs,
+                reward_z=critic_reward_z,
             )
         )
         metrics.update(
@@ -371,12 +489,17 @@ class FBcprAgent(FBAgent):
         discount: torch.Tensor,
         next_obs: torch.Tensor | dict[str, torch.Tensor],
         z: torch.Tensor,
+        reward_obs: torch.Tensor | dict[str, torch.Tensor] | None = None,
+        reward_z: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         with autocast(device_type=self.device, dtype=self._model.amp_dtype, enabled=self.cfg.model.amp):
             num_parallel = self.cfg.model.archi.critic.num_parallel
             # compute target critic
             with torch.no_grad():
-                reward = self._model._discriminator.compute_reward(obs=obs, z=z)
+                reward = self._model._discriminator.compute_reward(
+                    obs=obs if reward_obs is None else reward_obs,
+                    z=z if reward_z is None else reward_z,
+                )
                 dist = self._model._actor(next_obs, z, self._model.cfg.actor_std)
                 next_action = dist.sample(clip=self.cfg.train.stddev_clip)
                 next_Qs = self._model._target_critic(next_obs, z, next_action)  # num_parallel x batch x 1
