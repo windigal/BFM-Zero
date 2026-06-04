@@ -30,5 +30,5 @@ artifacts/
 *.pkl
 *.pdf
 *.csv
-*.md
+# *.md
 !README.md
