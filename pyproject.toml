@@ -74,6 +74,23 @@ dev-dependencies = [
     "ruff==0.9.6",
 ]
 index-strategy = "unsafe-best-match"
+# Lock only for the platform this project actually runs on (Linux x86_64).
+# isaacsim==5.1.0 pins typing-extensions==4.12.2 on other platforms (e.g. aarch64),
+# which conflicts with tyro>=0.9.18; restricting environments avoids resolving
+# those unused forks.
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+# isaacsim-kernel==5.1.0.0 hard-pins typing-extensions==4.12.2, which conflicts
+# with tyro>=0.9.18 (needs >=4.13.0). The installed env runs 4.15.0 fine (te is
+# backward-compatible), so override the over-strict pin to match reality.
+override-dependencies = ["typing-extensions>=4.13.0"]
+
+# flatdict 4.0.1 (transitive via isaaclab) ships an sdist that needs setuptools
+# at build time but doesn't declare it, breaking uv's metadata build. It has no
+# runtime deps, so declare its metadata directly to skip the build entirely.
+[[tool.uv.dependency-metadata]]
+name = "flatdict"
+version = "4.0.1"
+requires-dist = []
 
 [tool.ruff]
 line-length = 140
