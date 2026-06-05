@@ -467,6 +467,36 @@ class HumanoidVerseVectorEnv(VectorEnv):
 
         return observation
 
+    def _get_scaled_clean_obs(self, key: str) -> torch.Tensor:
+        scale = float(self._env.config.obs.obs_scales.get(key, 1.0))
+        return getattr(self._env, f"_get_obs_{key}")().detach().clone() * scale
+
+    def get_clean_observation(self, to_numpy: bool = True) -> dict[str, torch.Tensor]:
+        """Build the BFM reward-inference observation from current state without actor obs noise."""
+
+        raw_obs = {
+            "dof_pos": self._get_scaled_clean_obs("dof_pos"),
+            "dof_vel": self._get_scaled_clean_obs("dof_vel"),
+            "projected_gravity": self._get_scaled_clean_obs("projected_gravity"),
+            "base_ang_vel": self._get_scaled_clean_obs("base_ang_vel"),
+            "max_local_self": self._get_scaled_clean_obs("max_local_self"),
+        }
+        observation = {
+            "state": torch.cat(
+                [
+                    raw_obs["dof_pos"],
+                    raw_obs["dof_vel"],
+                    raw_obs["projected_gravity"],
+                    raw_obs["base_ang_vel"],
+                ],
+                dim=-1,
+            ),
+            "privileged_state": raw_obs["max_local_self"],
+        }
+        if to_numpy:
+            observation = tree_map(lambda x: x.cpu().numpy(), observation)
+        return observation
+
     def get_episodic_dr_info(self) -> Dict[str, np.ndarray]:
         """Get the episodic domain randomization information."""
         if not self.include_dr_info:

@@ -161,6 +161,7 @@ def main(
     print("Loading the replay buffer...", end=" ", flush=True)
     start_t = time.time()
     buffer_path = model_folder / "checkpoint/buffers/train_reduced"
+    clean_dataset = None
     if buffer_path.is_dir():
         # Load reduced buffer if that exists
         dataset = DictBuffer.load(buffer_path, device="cpu")
@@ -170,12 +171,17 @@ def main(
         buffer_path = model_folder / "checkpoint/buffers/train"
         dataset = TrajectoryDictBufferMultiDim.load(buffer_path, device="cpu")
         print("Loaded original buffer")
+        clean_buffer_path = model_folder / "checkpoint/buffers/train_clean"
+        if clean_buffer_path.is_dir():
+            clean_dataset = TrajectoryDictBufferMultiDim.load(clean_buffer_path, device="cpu")
+            print("Loaded clean reward buffer")
     # dataset = fast_load_buffer(model_folder / "checkpoint/buffers/train", device="cpu")
     print(f"done in {time.time()-start_t}s")
     inference_function = "reward_wr_inference"
     reward_eval_agent = RewardWrapperHV(
         model=model,
         inference_dataset=dataset,
+        clean_inference_dataset=clean_dataset,
         num_samples_per_inference=num_samples,
         inference_function=inference_function,
         max_workers=max_workers,

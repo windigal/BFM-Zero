@@ -14,7 +14,9 @@ import numpy as np
 from humenv.rewards import RewardFunction
 from humanoidverse.envs.g1_env_helper.robot import make_from_name
 from humanoidverse.agents.buffers.trajectory import TrajectoryDictBufferMultiDim
+from humanoidverse.agents.buffers.transition import DictBuffer, extract_values
 from humanoidverse.utils.g1_env_config import G1EnvConfigsType
+from torch.utils._pytree import tree_map
 
 @dataclasses.dataclass(kw_only=True)
 class RewardEvaluationHV:
@@ -66,6 +68,7 @@ class RewardWrapperHV(BaseHumEnvBenchWrapper):
     num_samples_per_inference: int
     inference_function: str
     max_workers: int
+    clean_inference_dataset: Any | None = None
     process_executor: bool = False
     process_context: str = "spawn"
     # env: Any = None
@@ -83,7 +86,11 @@ class RewardWrapperHV(BaseHumEnvBenchWrapper):
                 self.inference_dataset.output_key_tp1.append("qvel")
 
         # env, _ = self.make_env_fn(task=task, **kwargs)
-        if self.num_samples_per_inference >= self.inference_dataset.size() and hasattr(self.inference_dataset, "get_full_buffer"):
+        use_full_buffer = self.num_samples_per_inference >= self.inference_dataset.size() and hasattr(
+            self.inference_dataset,
+            "get_full_buffer",
+        )
+        if use_full_buffer:
             # TODO change from "hasattr" to some more sensible thing
             data = self.inference_dataset.get_full_buffer()
         else:
@@ -122,10 +129,51 @@ class RewardWrapperHV(BaseHumEnvBenchWrapper):
         if "B" in data:
             td["B_vect"] = data["B"]
         else:
-            td["next_obs"] = get_next("observation", data)
+            clean_next_obs = self._get_clean_next_observation(use_full_buffer=use_full_buffer)
+            td["next_obs"] = clean_next_obs if clean_next_obs is not None else get_next("observation", data)
         inference_fn = getattr(self.model, self.inference_function, None)
         ctxs = inference_fn(**td).reshape(1, -1)
         return ctxs
+
+    def _get_clean_next_observation(self, *, use_full_buffer: bool):
+        if self.clean_inference_dataset is None:
+            return None
+        if self.inference_dataset.size() != self.clean_inference_dataset.size():
+            return None
+
+        if use_full_buffer:
+            if not hasattr(self.clean_inference_dataset, "get_full_buffer"):
+                return None
+            if isinstance(self.clean_inference_dataset, TrajectoryDictBufferMultiDim):
+                if "observation" not in self.clean_inference_dataset.output_key_tp1:
+                    self.clean_inference_dataset.output_key_tp1.append("observation")
+            try:
+                return get_next("observation", self.clean_inference_dataset.get_full_buffer())
+            except (KeyError, ValueError):
+                return None
+
+        if isinstance(self.inference_dataset, TrajectoryDictBufferMultiDim):
+            next_idxs = getattr(self.inference_dataset, "last_sample_next_idxs", None)
+            clean_storage = getattr(self.clean_inference_dataset, "storage", None)
+            if next_idxs is None or clean_storage is None:
+                return None
+            try:
+                return tree_map(lambda x: x[next_idxs], clean_storage["observation"])
+            except (KeyError, IndexError, TypeError):
+                return None
+
+        if isinstance(self.inference_dataset, DictBuffer):
+            ind = getattr(self.inference_dataset, "ind", None)
+            clean_storage = getattr(self.clean_inference_dataset, "storage", None)
+            if ind is None or clean_storage is None:
+                return None
+            clean_data = extract_values(clean_storage, ind)
+            try:
+                return get_next("observation", clean_data)
+            except (KeyError, ValueError):
+                return clean_data.get("observation")
+
+        return None
 
     def __deepcopy__(self, memo):
         # Create a new instance of the same type as self
@@ -135,11 +183,13 @@ class RewardWrapperHV(BaseHumEnvBenchWrapper):
             numpy_output=self.numpy_output,
             _dtype=copy.deepcopy(self._dtype),
             inference_dataset=copy.deepcopy(self.inference_dataset),
+            clean_inference_dataset=copy.deepcopy(self.clean_inference_dataset),
             num_samples_per_inference=self.num_samples_per_inference,
             inference_function=self.inference_function,
             max_workers=self.max_workers,
             process_executor=self.process_executor,
             process_context=self.process_context,
+            env_model=self.env_model,
         )
 
     def __getstate__(self):
@@ -149,11 +199,13 @@ class RewardWrapperHV(BaseHumEnvBenchWrapper):
             "numpy_output": self.numpy_output,
             "_dtype": self._dtype,
             "inference_dataset": self.inference_dataset,
+            "clean_inference_dataset": self.clean_inference_dataset,
             "num_samples_per_inference": self.num_samples_per_inference,
             "inference_function": self.inference_function,
             "max_workers": self.max_workers,
             "process_executor": self.process_executor,
             "process_context": self.process_context,
+            "env_model": self.env_model,
         }
 
     def __setstate__(self, state):
@@ -162,11 +214,13 @@ class RewardWrapperHV(BaseHumEnvBenchWrapper):
         self.numpy_output = state["numpy_output"]
         self._dtype = state["_dtype"]
         self.inference_dataset = state["inference_dataset"]
+        self.clean_inference_dataset = state.get("clean_inference_dataset")
         self.num_samples_per_inference = state["num_samples_per_inference"]
         self.inference_function = state["inference_function"]
         self.max_workers = state["max_workers"]
         self.process_executor = state["process_executor"]
         self.process_context = state["process_context"]
+        self.env_model = state.get("env_model", "humanoidverse/data/robots/g1/scene_flat_terrain_playground.xml")
         
 
 def _relabel_worker(

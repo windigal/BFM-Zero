@@ -308,6 +308,8 @@ class TrainConfig(BaseConfig):
     # Buffer
     use_trajectory_buffer: bool = False
     buffer_size: int = 5_000_000
+    clean_reward_buffer: bool = False
+    clean_reward_buffer_name: str = "train_clean"
 
     # WANDB
     use_wandb: bool = True
@@ -564,7 +566,8 @@ class Workspace:
         print("Allocating buffers")
         replay_buffer = {}
         checkpoint_dir = self.work_dir / CHECKPOINT_DIR_NAME
-        if (checkpoint_dir / "buffers/train").exists():
+        train_buffer_loaded = (checkpoint_dir / "buffers/train").exists()
+        if train_buffer_loaded:
             print("Loading checkpointed buffer")
             if self.cfg.use_trajectory_buffer:
                 replay_buffer["train"] = TrajectoryDictBufferMultiDim.load(checkpoint_dir / "buffers/train", device=self.cfg.buffer_device)
@@ -588,6 +591,38 @@ class Workspace:
                 )
             else:
                 replay_buffer["train"] = DictBuffer(capacity=self.cfg.buffer_size, device=self.cfg.buffer_device)
+        use_clean_reward_buffer = self.cfg.clean_reward_buffer and hasattr(train_env, "get_clean_observation")
+        if self.cfg.clean_reward_buffer and not use_clean_reward_buffer:
+            warnings.warn("clean_reward_buffer=True requires an environment with get_clean_observation(); skipping clean buffer.")
+        if use_clean_reward_buffer:
+            clean_buffer_path = checkpoint_dir / "buffers" / self.cfg.clean_reward_buffer_name
+            if clean_buffer_path.exists():
+                print("Loading checkpointed clean reward buffer")
+                if self.cfg.use_trajectory_buffer:
+                    replay_buffer[self.cfg.clean_reward_buffer_name] = TrajectoryDictBufferMultiDim.load(
+                        clean_buffer_path,
+                        device=self.cfg.buffer_device,
+                    )
+                else:
+                    replay_buffer[self.cfg.clean_reward_buffer_name] = DictBuffer.load(clean_buffer_path, device=self.cfg.buffer_device)
+                print(f"Loaded clean buffer of size {len(replay_buffer[self.cfg.clean_reward_buffer_name])}")
+            elif train_buffer_loaded:
+                warnings.warn(
+                    f"{self.cfg.clean_reward_buffer_name} is missing for this checkpoint; "
+                    "skipping clean reward buffer to avoid misaligned replay samples."
+                )
+                use_clean_reward_buffer = False
+            elif self.cfg.use_trajectory_buffer:
+                replay_buffer[self.cfg.clean_reward_buffer_name] = TrajectoryDictBufferMultiDim(
+                    capacity=self.cfg.buffer_size // self.cfg.online_parallel_envs,
+                    device=self.cfg.buffer_device,
+                    n_dim=2,
+                    end_key="truncated",
+                    output_key_t=["observation"],
+                    output_key_tp1=["observation"],
+                )
+            else:
+                replay_buffer[self.cfg.clean_reward_buffer_name] = DictBuffer(capacity=self.cfg.buffer_size, device=self.cfg.buffer_device)
         if self.training_with_expert_data:
             replay_buffer["expert_slicer"] = expert_buffer
         self._latest_replay_buffer = replay_buffer
@@ -595,6 +630,7 @@ class Workspace:
         print("Starting training")
         progb = tqdm(total=self.cfg.num_env_steps, disable=self.cfg.disable_tqdm)
         td, info = train_env.reset()
+        clean_td = train_env.get_clean_observation(to_numpy=True) if use_clean_reward_buffer else None
         # see https://farama.org/Vector-Autoreset-Mode
         terminated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
         truncated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
@@ -637,6 +673,7 @@ class Workspace:
                 if uses_humanoidverse_eval:
                     # reset if there is a humanoidverse evaluation
                     td, info = train_env.reset()
+                    clean_td = train_env.get_clean_observation(to_numpy=True) if use_clean_reward_buffer else None
                     terminated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
                     truncated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
                     done = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
@@ -716,6 +753,7 @@ class Workspace:
                     if not isinstance(self.cfg.env, HumanoidVerseIsaacConfig):
                         action = action.cpu().detach().numpy()
             new_td, new_reward, new_terminated, new_truncated, new_info = train_env.step(action)
+            new_clean_td = train_env.get_clean_observation(to_numpy=True) if use_clean_reward_buffer else None
             collection_time_acc += time.time() - rollout_start
             steps_since_last_log += self.cfg.online_parallel_envs
 
@@ -788,6 +826,27 @@ class Workspace:
             else:
                 raise NotImplementedError("still some work to do for gymnasium < 1.0")
             replay_buffer["train"].extend(data)
+            if use_clean_reward_buffer:
+                if self.cfg.use_trajectory_buffer:
+                    clean_data = {
+                        "observation": tree_map(lambda x: x[None, ...], clean_td),
+                        "truncated": truncated[None, ..., None],
+                    }
+                else:
+                    clean_data = {
+                        "observation": tree_map(
+                            lambda x: x.astype(np.float32 if x.dtype == np.float64 else x.dtype)[indexes],
+                            clean_td,
+                        ),
+                        "truncated": new_truncated[indexes].reshape(-1, 1),
+                        "next": {
+                            "observation": tree_map(
+                                lambda x: x.astype(np.float32 if x.dtype == np.float64 else x.dtype)[indexes],
+                                new_clean_td,
+                            ),
+                        },
+                    }
+                replay_buffer[self.cfg.clean_reward_buffer_name].extend(clean_data)
 
             if len(replay_buffer["train"]) > 0 and t > self.cfg.num_seed_steps and update_agent_time_checker.check(t):
                 update_agent_time_checker.update_last_step(t)
@@ -863,6 +922,7 @@ class Workspace:
             progb.update(self.cfg.online_parallel_envs)
             self._latest_train_timestep = min(t + self.cfg.online_parallel_envs, self.cfg.num_env_steps)
             td = new_td
+            clean_td = new_clean_td if use_clean_reward_buffer else None
             terminated = new_terminated
             truncated = new_truncated
             done = np.logical_or(new_terminated.ravel(), new_truncated.ravel())
@@ -923,6 +983,10 @@ class Workspace:
         self.agent.save(str(self.work_dir / CHECKPOINT_DIR_NAME))
         if save_buffer:
             replay_buffer["train"].save(self.work_dir / CHECKPOINT_DIR_NAME / "buffers" / "train")
+            if self.cfg.clean_reward_buffer_name in replay_buffer:
+                replay_buffer[self.cfg.clean_reward_buffer_name].save(
+                    self.work_dir / CHECKPOINT_DIR_NAME / "buffers" / self.cfg.clean_reward_buffer_name
+                )
             self._latest_buffer_checkpoint_time = time
         with (self.work_dir / CHECKPOINT_DIR_NAME / "train_status.json").open("w+") as f:
             json.dump({"time": time, "buffer_time": self._latest_buffer_checkpoint_time}, f, indent=4)
@@ -1028,9 +1092,9 @@ def train_bfm_zero():
             device='cuda:0',
             # TODO this needs to be updated to point to a path with lafan dataset chunked into 10s clips
             # lafan_tail_path='humanoidverse/data/lafan_29dof_10s-clipped.pkl',
-            # lafan_tail_path='humanoidverse/data/seed_train_10s_2000.pkl',
+            lafan_tail_path='humanoidverse/data/seed_train_10s_2000.pkl',
             # lafan_tail_path='humanoidverse/data/seed_train_10s_2000_jump08_pair_with_contact.pkl',
-            lafan_tail_path='humanoidverse/data/babel_train_seed2k_windowed_2000_10s_50fps.pkl',
+            # lafan_tail_path='humanoidverse/data/babel_train_seed2k_windowed_2000_10s_50fps.pkl',
             enable_cameras=False,
             camera_render_save_dir='isaac_videos',
             max_episode_length_s=None,
@@ -1068,6 +1132,7 @@ def train_bfm_zero():
         prioritization_mode='exp',
         use_trajectory_buffer=True,
         buffer_size=5120000,
+        clean_reward_buffer=True,
         use_wandb=True,
         wandb_ename='windigal',  # your wandb entity (username/team), empty = default from wandb login
         wandb_gname='first-test',  # run group

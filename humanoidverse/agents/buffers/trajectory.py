@@ -215,10 +215,12 @@ class TrajectoryDictBufferMultiDim(DictBuffer):
             priorities=None,
         )
         idxs = idxs.to(torch.long).unbind(-1)
+        self.last_sample_idxs = idxs
         for k in self.output_key_t:
             output[k] = tree_map(lambda x: x[idxs], self.storage[k])
         # increment the time index to get the next states
         idxs = ((idxs[0] + 1) % self.capacity, *idxs[1:])
+        self.last_sample_next_idxs = idxs
         for k in self.output_key_tp1:
             output["next"][k] = tree_map(lambda x: x[idxs], self.storage[k])
         return output

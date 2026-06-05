@@ -27,6 +27,7 @@ from ..nn_models import (
     ActorArchiConfig,
     BackwardArchiConfig,
     ForwardArchiConfig,
+    MoEBackwardArchiConfig,
     ResidualActorArchiConfig,
     SimpleActorArchiConfig,
     eval_mode,
@@ -39,7 +40,10 @@ class FBModelArchiConfig(BaseConfig):
     z_dim: int = 100
     norm_z: bool = True
     f: ForwardArchiConfig | ForwardFilterArchiConfig = pydantic.Field(ForwardArchiConfig(), discriminator="name")
-    b: BackwardArchiConfig | BackwardFilterArchiConfig = pydantic.Field(BackwardArchiConfig(), discriminator="name")
+    b: BackwardArchiConfig | BackwardFilterArchiConfig | MoEBackwardArchiConfig = pydantic.Field(
+        BackwardArchiConfig(),
+        discriminator="name",
+    )
     # Because of the "name" attribute, these two can be chosen between via strings easily
     actor: (
         ActorArchiConfig

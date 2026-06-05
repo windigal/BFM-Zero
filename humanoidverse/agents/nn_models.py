@@ -226,6 +226,58 @@ class BackwardMap(nn.Module):
         return self.net(x)
 
 
+class MoEBackwardArchiConfig(BaseConfig):
+    name: tp.Literal["MoEBackwardArchi"] = "MoEBackwardArchi"
+    expert_num: int = 4
+    hidden_dim: int = 256
+    hidden_layers: int = 1
+    norm: bool = True
+    input_filter: NNFilter = IdentityInputFilterConfig()
+
+    def model_post_init(self, context):
+        if self.expert_num < 1:
+            raise ValueError("expert_num must be >= 1")
+        if self.hidden_layers < 1:
+            raise ValueError("hidden_layers must be >= 1")
+
+    def build(self, obs_space, z_dim: int):
+        return MoEBackwardMap(obs_space, z_dim, self)
+
+
+def _moe_mlp(input_dim: int, hidden_dim: int, hidden_layers: int, output_dim: int) -> nn.Sequential:
+    seq = [nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.Tanh()]
+    for _ in range(hidden_layers - 1):
+        seq += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
+    seq += [nn.Linear(hidden_dim, output_dim)]
+    return nn.Sequential(*seq)
+
+
+class MoEBackwardMap(nn.Module):
+    def __init__(self, obs_space, z_dim, cfg: MoEBackwardArchiConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.input_filter = cfg.input_filter.build(obs_space)
+        filtered_space = self.input_filter.output_space
+
+        assert isinstance(filtered_space, gymnasium.spaces.Box), (
+            f"filtered_space must be a Box space, got {type(filtered_space)}. Did you forget to set input_filter?"
+        )
+        assert len(filtered_space.shape) == 1, "filtered_space must have a 1D shape"
+        input_dim = filtered_space.shape[0]
+        self.experts = nn.ModuleList(
+            [_moe_mlp(input_dim, cfg.hidden_dim, cfg.hidden_layers, z_dim) for _ in range(cfg.expert_num)]
+        )
+        self.gating = _moe_mlp(input_dim, cfg.hidden_dim, cfg.hidden_layers, cfg.expert_num)
+        self.norm = Norm() if cfg.norm else nn.Identity()
+
+    def forward(self, x: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor:
+        x = self.input_filter(x)
+        weights = torch.softmax(self.gating(x), dim=-1)
+        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=1)
+        output = torch.sum(weights.unsqueeze(-1) * expert_outputs, dim=1)
+        return self.norm(output)
+
+
 def simple_embedding(input_dim, hidden_dim, hidden_layers, num_parallel=1):
     assert hidden_layers >= 2, "must have at least 2 embedding layers"
     seq = [linear(input_dim, hidden_dim, num_parallel), layernorm(hidden_dim, num_parallel), nn.Tanh()]
