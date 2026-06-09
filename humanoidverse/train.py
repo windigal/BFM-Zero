@@ -3,7 +3,54 @@
 # This source code is licensed under the CC BY-NC 4.0 license found in the
 # LICENSE file in the root directory of this source tree.
 
+import argparse
 import os
+import sys
+
+
+def _normalize_gpu_id(gpu_id: str | int | None) -> str | None:
+    if gpu_id is None:
+        return None
+    gpu_id_text = str(gpu_id).strip()
+    if not gpu_id_text:
+        raise ValueError("--gpu-id cannot be empty")
+    if gpu_id_text.startswith("cuda:"):
+        gpu_id_text = gpu_id_text.split(":", 1)[1]
+
+    gpu_ids = [part.strip() for part in gpu_id_text.split(",")]
+    if any(not part.isdigit() for part in gpu_ids):
+        raise ValueError(f"--gpu-id must be a CUDA device index like '0' or '1'; got {gpu_id!r}")
+    return ",".join(str(int(part)) for part in gpu_ids)
+
+
+def _configure_cuda_visible_devices(gpu_id: str | int | None) -> str | None:
+    normalized_gpu_id = _normalize_gpu_id(gpu_id)
+    if normalized_gpu_id is None:
+        return None
+
+    current_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if current_visible_devices == normalized_gpu_id:
+        return normalized_gpu_id
+
+    torch_module = sys.modules.get("torch")
+    if torch_module is not None and torch_module.cuda.is_initialized():
+        raise RuntimeError(
+            "Cannot apply --gpu-id after CUDA has already been initialized. "
+            "Launch a fresh process with --gpu-id, or set CUDA_VISIBLE_DEVICES before Python starts."
+        )
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = normalized_gpu_id
+    return normalized_gpu_id
+
+
+def _preparse_gpu_id(argv: list[str]) -> str | None:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--gpu-id", default=None)
+    args, _ = parser.parse_known_args(argv[1:])
+    return args.gpu_id
+
+
+_PRESELECTED_GPU_ID = _configure_cuda_visible_devices(_preparse_gpu_id(sys.argv))
 
 from humanoidverse.agents.evaluations.humanoidverse_isaac import (
     HumanoidVerseIsaacTrackingEvaluation,
@@ -318,6 +365,7 @@ class TrainConfig(BaseConfig):
     wandb_pname: str | None = "BFM-Zero"
 
     # misc
+    gpu_id: str | None = None
     load_isaac_expert_data: bool = True
     buffer_device: str = "cpu"
     # Default to True; otherwise you will spam the console with tqdm
@@ -992,10 +1040,22 @@ class Workspace:
             json.dump({"time": time, "buffer_time": self._latest_buffer_checkpoint_time}, f, indent=4)
 
 
-def train_bfm_zero():
+def train_bfm_zero(
+    gpu_id: str | None = None,
+):
+    """Launch BFM-Zero training.
+
+    Args:
+        gpu_id: Physical CUDA device index to expose to this process, e.g. "0" or "1".
+            Internally the selected device is still addressed as cuda/cuda:0.
+    """
+    selected_gpu_id = _configure_cuda_visible_devices(gpu_id if gpu_id is not None else _PRESELECTED_GPU_ID)
+    if selected_gpu_id is not None:
+        print(f"Using physical CUDA device(s): {selected_gpu_id} via CUDA_VISIBLE_DEVICES={selected_gpu_id}")
+
     from humanoidverse.agents.fb_cpr_aux.model import FBcprAuxModelArchiConfig, FBcprAuxModelConfig
     from humanoidverse.agents.fb_cpr_aux.agent import FBcprAuxAgentTrainConfig
-    from humanoidverse.agents.nn_models import ForwardArchiConfig, BackwardArchiConfig, ActorArchiConfig, DiscriminatorArchiConfig, RewardNormalizerConfig
+    from humanoidverse.agents.nn_models import ForwardArchiConfig, BackwardArchiConfig, ActorArchiConfig, ActorArchiConfig, DiscriminatorArchiConfig, RewardNormalizerConfig, MoEBackwardArchiConfig
     from humanoidverse.agents.normalizers import ObsNormalizerConfig, BatchNormNormalizerConfig
     from humanoidverse.agents.nn_filters import DictInputFilterConfig
 
@@ -1012,6 +1072,7 @@ def train_bfm_zero():
                     norm_z=True,
                     f=ForwardArchiConfig(name='ForwardArchi', hidden_dim=1024, model='residual', hidden_layers=4, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
                     b=BackwardArchiConfig(name='BackwardArchi', hidden_dim=256, hidden_layers=1, norm=True, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
+                    # b=MoEBackwardArchiConfig(name='MoEBackwardArchi', expert_num=4, hidden_dim=256, hidden_layers=1, norm=True, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
                     actor=ActorArchiConfig(name='actor', model='residual', hidden_dim=1024, hidden_layers=4, embedding_layers=2, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'last_action', 'history_actor'])),
                     critic=ForwardArchiConfig(name='ForwardArchi', hidden_dim=1024, model='residual', hidden_layers=4, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
                     discriminator=DiscriminatorArchiConfig(name='DiscriminatorArchi', hidden_dim=512, hidden_layers=3, num_obs_steps=1, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
@@ -1137,6 +1198,7 @@ def train_bfm_zero():
         wandb_ename='windigal',  # your wandb entity (username/team), empty = default from wandb login
         wandb_gname='first-test',  # run group
         wandb_pname='BFM-Zero',  # your wandb project name
+        gpu_id=selected_gpu_id,
         load_isaac_expert_data=True,
         buffer_device='cpu',
         disable_tqdm=True,
@@ -1151,6 +1213,6 @@ def train_bfm_zero():
 if __name__ == "__main__":
     # This is the bare minimum CLI interface to launch experiments, but ideally you should
     # launch your experiments from Python code (e.g., see under "scripts")
-    train_bfm_zero()
+    tyro.cli(train_bfm_zero)
 
 # uv run --no-cache -m humanoidverse.meta_online_entry_point

@@ -21,6 +21,7 @@ build/
 .idea/
 
 # 运行结果
+.cache/
 wandb/
 results/
 checkpoint/
