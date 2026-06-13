@@ -358,6 +358,12 @@ class TrainConfig(BaseConfig):
     clean_reward_buffer: bool = False
     clean_reward_buffer_name: str = "train_clean"
 
+    # Post-training from an existing checkpoint.
+    post_train_freeze_fb: bool = False
+    post_train_require_checkpoint_buffer: bool = False
+    post_train_add_env_steps: int | None = None
+    post_train_rollout_expert_trajectories_percentage: float | None = None
+
     # WANDB
     use_wandb: bool = True
     wandb_ename: str | None = "windigal"
@@ -395,6 +401,12 @@ class TrainConfig(BaseConfig):
                 "checkpoint_buffer_every_steps",
                 int(self.checkpoint_buffer_every_iterations * self.online_parallel_envs),
             )
+        if self.post_train_add_env_steps is not None and self.post_train_add_env_steps <= 0:
+            raise ValueError("post_train_add_env_steps must be positive when set")
+        if self.post_train_rollout_expert_trajectories_percentage is not None:
+            ratio = self.post_train_rollout_expert_trajectories_percentage
+            if ratio < 0 or ratio > 1:
+                raise ValueError("post_train_rollout_expert_trajectories_percentage must be in [0, 1]")
         # TODO prioritization needs tracking eval to work, but this is bit hacky to check for it
         if self.load_isaac_expert_data and not isinstance(self.env, HumanoidVerseIsaacConfig):
             raise ValueError("Loading expert isaac data is only supported for HumanoidVerseIsaacConfig")
@@ -431,6 +443,20 @@ class TrainConfig(BaseConfig):
         return Workspace(self)
 
 
+def _checkpoint_agent_config_update(cfg: TrainConfig) -> dict[str, tp.Any] | None:
+    update: dict[str, tp.Any] = {}
+    train_update: dict[str, tp.Any] = {}
+    if cfg.post_train_rollout_expert_trajectories_percentage is not None:
+        train_update["rollout_expert_trajectories"] = True
+        train_update["rollout_expert_trajectories_percentage"] = cfg.post_train_rollout_expert_trajectories_percentage
+    if train_update:
+        update["train"] = train_update
+    if cfg.post_train_freeze_fb:
+        update["compile"] = False
+        update["cudagraphs"] = False
+    return update or None
+
+
 def create_agent_or_load_checkpoint(work_dir: Path, cfg: TrainConfig, agent_build_kwargs: dict[str, tp.Any]):
     checkpoint_dir = work_dir / CHECKPOINT_DIR_NAME
     checkpoint_time = 0
@@ -441,8 +467,15 @@ def create_agent_or_load_checkpoint(work_dir: Path, cfg: TrainConfig, agent_buil
         checkpoint_time = int(train_status["time"])
 
         print(f"Loading the agent at time {checkpoint_time}")
-        agent = cfg.agent.object_class.load(checkpoint_dir, device=cfg.agent.model.device)
+        agent = cfg.agent.object_class.load(
+            checkpoint_dir,
+            device=cfg.agent.model.device,
+            config_update=_checkpoint_agent_config_update(cfg),
+        )
+        cfg = cfg.model_copy(update={"agent": agent.cfg})
     else:
+        if cfg.post_train_freeze_fb:
+            raise ValueError("post_train_freeze_fb=True requires work_dir to contain a checkpoint")
         agent = cfg.agent.build(**agent_build_kwargs)
     return agent, cfg, checkpoint_time, train_status
 
@@ -542,7 +575,21 @@ class Workspace:
         self.agent, self.cfg, self._checkpoint_time, self._train_status = create_agent_or_load_checkpoint(
             self.work_dir, self.cfg, agent_build_kwargs=dict(obs_space=self.obs_space, action_dim=self.action_dim)
         )
+        if self.cfg.post_train_add_env_steps is not None:
+            if self._checkpoint_time <= 0:
+                raise ValueError("post_train_add_env_steps requires work_dir to contain a checkpoint")
+            self.cfg = self.cfg.model_copy(
+                update={"num_env_steps": self._checkpoint_time + self.cfg.post_train_add_env_steps}
+            )
         self.agent._model.train()
+        if self.cfg.post_train_freeze_fb:
+            self.agent.freeze_fb_maps(sync_targets=True)
+            print(
+                "Post-training mode: froze F/B maps and synchronized target F/B maps. "
+                f"rollout_expert_trajectories={self.agent.cfg.train.rollout_expert_trajectories}, "
+                f"rollout_expert_trajectories_percentage={self.agent.cfg.train.rollout_expert_trajectories_percentage}, "
+                f"num_env_steps={self.cfg.num_env_steps}"
+            )
 
         if isinstance(self.cfg.evaluations, list):
             self.evaluations = {eval_cfg.name_in_logs: eval_cfg.build() for eval_cfg in self.cfg.evaluations}
@@ -615,6 +662,11 @@ class Workspace:
         replay_buffer = {}
         checkpoint_dir = self.work_dir / CHECKPOINT_DIR_NAME
         train_buffer_loaded = (checkpoint_dir / "buffers/train").exists()
+        if self.cfg.post_train_require_checkpoint_buffer and not train_buffer_loaded:
+            raise ValueError(
+                "post_train_require_checkpoint_buffer=True but checkpoint/buffers/train is missing. "
+                "Use a checkpoint with saved buffers or disable the requirement."
+            )
         if train_buffer_loaded:
             print("Loading checkpointed buffer")
             if self.cfg.use_trajectory_buffer:
@@ -1022,6 +1074,8 @@ class Workspace:
         if not isinstance(self.cfg.env, HumanoidVerseIsaacConfig):
             self.agent._model.to(self.cfg.agent.model.device)
         self.agent._model.train()
+        if self.cfg.post_train_freeze_fb:
+            self.agent.freeze_fb_maps(sync_targets=False)
 
         return evaluation_results
 
@@ -1042,12 +1096,24 @@ class Workspace:
 
 def train_bfm_zero(
     gpu_id: str | None = None,
+    work_dir: str | None = None,
+    num_env_steps: int | None = None,
+    post_train_add_env_steps: int | None = None,
+    post_train_freeze_fb: bool = False,
+    post_train_require_checkpoint_buffer: bool = False,
+    post_train_rollout_expert_trajectories_percentage: float | None = None,
 ):
     """Launch BFM-Zero training.
 
     Args:
         gpu_id: Physical CUDA device index to expose to this process, e.g. "0" or "1".
             Internally the selected device is still addressed as cuda/cuda:0.
+        work_dir: Result directory. If it contains checkpoint/, training resumes from it.
+        num_env_steps: Absolute final env-step target. Leave unset for the default recipe.
+        post_train_add_env_steps: Additional env steps to run after the loaded checkpoint time.
+        post_train_freeze_fb: Freeze F/B maps after loading a checkpoint.
+        post_train_require_checkpoint_buffer: Require checkpoint/buffers/train to exist.
+        post_train_rollout_expert_trajectories_percentage: Override expert-z rollout env ratio after loading.
     """
     selected_gpu_id = _configure_cuda_visible_devices(gpu_id if gpu_id is not None else _PRESELECTED_GPU_ID)
     if selected_gpu_id is not None:
@@ -1173,11 +1239,11 @@ def train_bfm_zero(
             root_height_obs=True,
             use_contact_in_obs_max=False,
         ),
-        work_dir=_make_timestamped_result_dir('results/bfmzero-isaac'),
+        work_dir=work_dir or _make_timestamped_result_dir('results/bfmzero-isaac'),
         seed=42,
         online_parallel_envs=1024,
         log_every_updates=51200, # 50 iter * 1024 env steps/iter
-        num_env_steps=384000000,
+        num_env_steps=num_env_steps if num_env_steps is not None else 384000000,
         update_agent_every=1024,
         num_seed_steps=10240,
         num_agent_updates=16,
@@ -1194,6 +1260,10 @@ def train_bfm_zero(
         use_trajectory_buffer=True,
         buffer_size=5120000,
         clean_reward_buffer=True,
+        post_train_freeze_fb=post_train_freeze_fb,
+        post_train_require_checkpoint_buffer=post_train_require_checkpoint_buffer,
+        post_train_add_env_steps=post_train_add_env_steps,
+        post_train_rollout_expert_trajectories_percentage=post_train_rollout_expert_trajectories_percentage,
         use_wandb=True,
         wandb_ename='windigal',  # your wandb entity (username/team), empty = default from wandb login
         wandb_gname='first-test',  # run group

@@ -6,7 +6,7 @@
 import json
 import pickle
 from pathlib import Path
-from typing import Dict, Literal, Tuple
+from typing import Any, Dict, Literal, Tuple
 
 import safetensors
 import torch
@@ -19,6 +19,14 @@ from ..envs.utils.gym_spaces import json_to_space, space_to_json
 from ..misc.zbuffer import ZBuffer
 from ..nn_models import _soft_update_params, eval_mode, weight_init
 from .model import FBModel, FBModelConfig
+
+
+def _deep_update_dict(target: dict[str, Any], update: dict[str, Any]) -> None:
+    for key, value in update.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _deep_update_dict(target[key], value)
+        else:
+            target[key] = value
 
 
 class FBAgentTrainConfig(BaseConfig):
@@ -74,6 +82,7 @@ class FBAgent:
         self._model.to(self.device)
 
         self.env_idx_with_expert_rollout = None
+        self.fb_maps_frozen = False
 
     @property
     def device(self):
@@ -140,6 +149,26 @@ class FBAgent:
             self.update_fb = CudaGraphModule(self.update_fb, warmup=5)
             self.update_actor = CudaGraphModule(self.update_actor, warmup=5)
 
+    def freeze_fb_maps(self, *, sync_targets: bool = True) -> None:
+        if sync_targets:
+            self._model._target_forward_map.load_state_dict(self._model._forward_map.state_dict())
+            self._model._target_backward_map.load_state_dict(self._model._backward_map.state_dict())
+        for module in (
+            self._model._forward_map,
+            self._model._backward_map,
+            self._model._target_forward_map,
+            self._model._target_backward_map,
+        ):
+            module.eval()
+            module.requires_grad_(False)
+        self.fb_maps_frozen = True
+
+    def soft_update_fb_targets(self) -> None:
+        if self.fb_maps_frozen:
+            return
+        _soft_update_params(self._forward_map_paramlist, self._target_forward_map_paramlist, self.fb_target_tau)
+        _soft_update_params(self._backward_map_paramlist, self._target_backward_map_paramlist, self.fb_target_tau)
+
     def act(self, obs: torch.Tensor | dict[str, torch.Tensor], z: torch.Tensor, mean: bool = True) -> torch.Tensor:
         return self._model.act(obs, z, mean)
 
@@ -202,8 +231,7 @@ class FBAgent:
         )
 
         with torch.no_grad():
-            _soft_update_params(self._forward_map_paramlist, self._target_forward_map_paramlist, self.fb_target_tau)
-            _soft_update_params(self._backward_map_paramlist, self._target_backward_map_paramlist, self.fb_target_tau)
+            self.soft_update_fb_targets()
 
         return metrics
 
@@ -268,15 +296,15 @@ class FBAgent:
                 q_loss = 0.5 * Fs.shape[0] * F.mse_loss(Qs, expanded_targets)
                 fb_loss += q_loss_coef * q_loss
 
-        # optimize FB
-        self.forward_optimizer.zero_grad(set_to_none=True)
-        self.backward_optimizer.zero_grad(set_to_none=True)
-        fb_loss.backward()
-        if clip_grad_norm is not None:
-            torch.nn.utils.clip_grad_norm_(self._model._forward_map.parameters(), clip_grad_norm)
-            torch.nn.utils.clip_grad_norm_(self._model._backward_map.parameters(), clip_grad_norm)
-        self.forward_optimizer.step()
-        self.backward_optimizer.step()
+        if not self.fb_maps_frozen:
+            self.forward_optimizer.zero_grad(set_to_none=True)
+            self.backward_optimizer.zero_grad(set_to_none=True)
+            fb_loss.backward()
+            if clip_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(self._model._forward_map.parameters(), clip_grad_norm)
+                torch.nn.utils.clip_grad_norm_(self._model._backward_map.parameters(), clip_grad_norm)
+            self.forward_optimizer.step()
+            self.backward_optimizer.step()
 
         with torch.no_grad():
             output_metrics = {
@@ -293,6 +321,7 @@ class FBAgent:
                 "orth_loss_diag": orth_loss_diag,
                 "orth_loss_offdiag": orth_loss_offdiag,
                 "q_loss": q_loss,
+                "fb_maps_frozen": torch.tensor(float(self.fb_maps_frozen), device=z.device),
             }
         return output_metrics
 
@@ -382,12 +411,14 @@ class FBAgent:
         return z
 
     @classmethod
-    def load(cls, path: str, device: str | None = None):
+    def load(cls, path: str, device: str | None = None, config_update: dict[str, Any] | None = None):
         path = Path(path)
         with (path / "config.json").open() as f:
             loaded_config = json.load(f)
         if device is not None:
             loaded_config["model"]["device"] = device
+        if config_update:
+            _deep_update_dict(loaded_config, config_update)
 
         if (path / "init_kwargs.pkl").exists():
             # Load arguments from a pickle file

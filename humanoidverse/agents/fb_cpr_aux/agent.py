@@ -215,16 +215,7 @@ class FBcprAuxAgent(FBcprAgent):
         )
 
         with torch.no_grad():
-            _soft_update_params(
-                self._forward_map_paramlist,
-                self._target_forward_map_paramlist,
-                self.cfg.train.fb_target_tau,
-            )
-            _soft_update_params(
-                self._backward_map_paramlist,
-                self._target_backward_map_paramlist,
-                self.cfg.train.fb_target_tau,
-            )
+            self.soft_update_fb_targets()
             _soft_update_params(
                 self._critic_map_paramlist,
                 self._target_critic_map_paramlist,
