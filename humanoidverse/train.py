@@ -1098,6 +1098,7 @@ def train_bfm_zero(
     gpu_id: str | None = None,
     work_dir: str | None = None,
     num_env_steps: int | None = None,
+    clean_reward_buffer: bool = True,
     post_train_add_env_steps: int | None = None,
     post_train_freeze_fb: bool = False,
     post_train_require_checkpoint_buffer: bool = False,
@@ -1110,6 +1111,7 @@ def train_bfm_zero(
             Internally the selected device is still addressed as cuda/cuda:0.
         work_dir: Result directory. If it contains checkpoint/, training resumes from it.
         num_env_steps: Absolute final env-step target. Leave unset for the default recipe.
+        clean_reward_buffer: Store/load the aligned clean reward buffer.
         post_train_add_env_steps: Additional env steps to run after the loaded checkpoint time.
         post_train_freeze_fb: Freeze F/B maps after loading a checkpoint.
         post_train_require_checkpoint_buffer: Require checkpoint/buffers/train to exist.
@@ -1259,7 +1261,7 @@ def train_bfm_zero(
         prioritization_mode='exp',
         use_trajectory_buffer=True,
         buffer_size=5120000,
-        clean_reward_buffer=True,
+        clean_reward_buffer=clean_reward_buffer,
         post_train_freeze_fb=post_train_freeze_fb,
         post_train_require_checkpoint_buffer=post_train_require_checkpoint_buffer,
         post_train_add_env_steps=post_train_add_env_steps,
